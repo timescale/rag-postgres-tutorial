@@ -65,8 +65,6 @@ create table documents
 , geom                geometry(Point, 4326)                               -- optional WGS84 point
 , embedding           halfvec(1536)                                       -- nullable until embedded
 , embedding_version   int           not null default 1                    -- bumps on content change
-, embedding_attempts  int           not null default 0
-, embedding_last_error text
 , created_at          timestamptz   not null default now()
 , updated_at          timestamptz
 );
@@ -87,7 +85,7 @@ A few decisions worth explaining:
 - **One table or many?** Depends on whether you want to search across document types together or keep them separate. If a single query should be able to retrieve a blog post, an email, and a PDF in the same ranked result list, put them in one table and express the type in `meta->>'type'` — you get one set of indexes and one BM25/HNSW build to maintain. If the corpora are genuinely independent (different access patterns, different lifecycles, different embedding models), separate tables are fine and the same schema below still applies per-table.
 - **`embedding` is nullable.** Writes don't block on calling OpenAI. The vector is filled in asynchronously by a worker (Step 4). This is the single most important design decision in the whole post.
 - **`embedding_version` enforces correctness.** When content changes, this number ticks. The worker only writes back if the version still matches what it claimed — otherwise it would clobber a fresh row with a stale vector.
-- **`tree` (ltree) instead of `parent_id`.** Path queries (`work.projects.acme.notes <@ work.projects`) are O(log n) and don't need recursive CTEs. Patterns (`*.api.*`) and label queries (`api & v2`) are first-class.
+- **`tree` (ltree) instead of `parent_id`.** Path queries (`work.projects.acme.notes <@ work.projects`) are O(log n) and don't need recursive CTEs. Patterns (`*.api.*`) and label queries (`api & v2`) are first-class. Labels are restricted to `[A-Za-z0-9_]` (max 256 chars), so sanitize at write time — e.g. `"Noise - Residential"` has to become `noise_residential` or you'll get `syntax error in ltree`.
 - **`temporal` (tstzrange) is optional.** Point-in-time events (`[t,t]`) and date ranges (`[start,end)`) live in the same column with the same operators.
 - **`geom` is a `geometry(Point, 4326)`.** SRID 4326 is WGS84 lat/lon — what GPS, OpenStreetMap, and basically every web map use. Store coordinates as `ST_SetSRID(ST_MakePoint(lon, lat), 4326)`. Note the order: PostGIS is `(longitude, latitude)`, not `(latitude, longitude)` — getting this wrong is the #1 PostGIS bug.
 
@@ -127,7 +125,7 @@ create index documents_embedding_hnsw_idx
 -- Partial index for the worker to find rows that still need embeddings
 create index documents_pending_embedding_idx
   on documents (created_at)
-  where embedding is null and embedding_attempts < 3;
+  where embedding is null;
 ```
 
 Notes:
@@ -138,27 +136,17 @@ Notes:
 
 ## Step 3 — The before-update trigger
 
-When `content` changes, the embedding becomes stale. Don't make application code remember this — push it down:
+When `content` changes, the embedding becomes stale. Don't make application code remember this — automate it in the database:
 
 ```sql
 create function documents_before_update() returns trigger as $$
 begin
   new.updated_at := now();
 
-  -- Content changed: invalidate embedding and bump version
-  if old.content is distinct from new.content
-     and old.embedding is not distinct from new.embedding
-  then
+  -- Content changed: invalidate embedding and bump version.
+  if old.content <> new.content then
     new.embedding := null;
     new.embedding_version := old.embedding_version + 1;
-    new.embedding_attempts := 0;
-    new.embedding_last_error := null;
-  end if;
-
-  -- Worker writing the embedding back: clear error state
-  if new.embedding is not null and old.embedding is distinct from new.embedding then
-    new.embedding_attempts := 0;
-    new.embedding_last_error := null;
   end if;
 
   return new;
@@ -170,7 +158,7 @@ create trigger documents_before_update_trg
   for each row execute function documents_before_update();
 ```
 
-The `is distinct from` checks are deliberate — they treat NULLs as comparable, so a content change paired with the worker's embedding write doesn't trip both branches. The version bump is the contract between writers and the worker.
+The worker's writeback only touches `embedding`, so `old.content <> new.content` is false and the trigger no-ops — exactly what we want. On a real content edit, the trigger nulls out the stale embedding and bumps `embedding_version`; the bump is the contract that lets the claim function detect and cancel in-flight queue jobs that were generated for the old content.
 
 ## Step 4 — The embedding queue
 
@@ -237,12 +225,11 @@ create trigger documents_enqueue_on_update
   after update on documents
   for each row
   when (old.content is distinct from new.content
-        and new.embedding is null
-        and new.embedding_attempts < 3)
+        and new.embedding is null)
   execute function enqueue_embedding();
 ```
 
-Two triggers, two `when` clauses. The insert one only fires when the application didn't provide an embedding upfront. The update one only fires when content actually changed and we haven't already exhausted attempts.
+Two triggers, two `when` clauses. The insert one only fires when the application didn't provide an embedding upfront. The update one only fires when content actually changed.
 
 ### 4c. The claim function
 
@@ -292,7 +279,7 @@ begin
     select d.content, d.embedding_version into doc
     from documents d where d.id = rec.document_id;
 
-    if not found or doc.content is null then
+    if not found then
       update embedding_queue set outcome = 'cancelled' where id = rec.id;
       continue;
     end if;
@@ -347,7 +334,7 @@ const model = openai.textEmbeddingModel('text-embedding-3-small');
 async function processBatch() {
   // 1. Claim
   const claimed = await sql`
-    select * from claim_embedding_batch(10, '5 minutes'::interval)
+    select * from claim_embedding_batch(64, '5 minutes'::interval)
   `;
   if (claimed.length === 0) return 0;
 
@@ -359,9 +346,6 @@ async function processBatch() {
   });
 
   // 3. Write back in a single round trip, version-guarded.
-  // A naive per-row writeback (2 UPDATEs × batch size) is the throughput
-  // ceiling on a cloud DB — at 50–80ms RTT and batch 256, ~25–40s/batch
-  // is just waiting on the network. Bulk it with `unnest`:
   const ids       = claimed.map(r => r.document_id);
   const versions  = claimed.map(r => r.embedding_version);
   const queueIds  = claimed.map(r => r.queue_id);
@@ -400,11 +384,12 @@ async function run() {
 }
 ```
 
-The three behaviors to get right:
+The behaviors to get right:
 
 1. **Adaptive polling.** Loop immediately when you found work; sleep when idle. A worker that polls every 100ms when empty wastes the database.
 2. **Version-guarded writeback** (`where embedding_version = $3`). This is the safety net for the race against concurrent content edits.
 3. **Multiple workers, zero coordination.** Thanks to `SKIP LOCKED`, you can run 1 or 10 workers without changing any code. They'll partition the queue cleanly.
+4. **Batch size, and a single bulk writeback.** Against a cloud DB at ~50–80 ms RTT, 32–128 is the sweet spot for the claim batch — smaller batches leave the worker waiting on the network, larger batches hold the visibility lease too long if the claim raises mid-flight. The writeback itself has to be a *single* statement using `unnest` to fan out the per-row updates; a naive per-row writeback (2 UPDATEs × batch size) is the throughput ceiling on a cloud DB.
 
 > **What about rate limits?** The AI SDK retries 429s with exponential backoff that respects `Retry-After`. For most workers, `maxRetries: 5` is plenty. If a request still fails after that, the batch raises, the visibility timeout on the queue rows lapses, and another worker (or the same one, after restart) picks them up — `attempts < max_attempts` in `claim_embedding_batch` is the final backstop. You only need custom rate-limit detection if you're running a multi-tenant worker that needs to pause globally on rate limits, or if you want to avoid counting 429s against a queue's retry budget. Both are advanced optimizations, not defaults.
 
@@ -752,14 +737,14 @@ async function filterOnly(p: SearchParams, limit: number) {
 // --- Helpers ---
 
 function buildFilters(p: SearchParams) {
-  const parts = [];
+  // `postgres.Fragment` is the type the template tag accepts for nested
+  // pieces; arrays of fragments are stitched together at runtime. The
+  // `as postgres.JSONValue` cast on `p.meta` is to satisfy `sql.json(...)`'s
+  // readonly-recursive type — use `sql.json` rather than `JSON.stringify`,
+  // since a stringified object becomes a JSON scalar that matches nothing.
+  const parts: postgres.Fragment[] = [];
   if (p.tree)                                   parts.push(sql`and tree <@ ${p.tree}::ltree`);
-  // `sql.json(...)` is the postgres-js helper for sending a plain object as a
-  // JSONB parameter; it's the form that type-checks against the library's
-  // `JSONValue` constraint. Don't JSON.stringify yourself — postgres-js will
-  // re-encode the string and you end up with a quoted JSON scalar that
-  // matches nothing.
-  if (p.meta && Object.keys(p.meta).length > 0) parts.push(sql`and meta @> ${sql.json(p.meta)}::jsonb`);
+  if (p.meta && Object.keys(p.meta).length > 0) parts.push(sql`and meta @> ${sql.json(p.meta as postgres.JSONValue)}::jsonb`);
   if (p.temporal) {
     const { from, to } = p.temporal;
     if (from && to) parts.push(sql`and temporal && tstzrange(${from}::timestamptz, ${to}::timestamptz, '[)')`);
@@ -871,7 +856,7 @@ Combine with tree, meta, temporal, and near (geo) filters. Results scored 0-1.`,
         to:   args.temporal.to   ?? undefined,
       } : undefined,
       near:     args.near ?? undefined,
-      limit:    args.limit && args.limit > 0 ? args.limit : 10,
+      limit:    args.limit && args.limit > 0 ? Math.min(args.limit, 1000) : 10,
     });
     return {
       content: [{ type: 'text', text: JSON.stringify(results, null, 2) }],
