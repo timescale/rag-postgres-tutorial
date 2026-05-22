@@ -69,21 +69,20 @@ export async function searchDocuments(params: SearchParams): Promise<SearchResul
 // --- Mode implementations ---
 
 async function bm25Search(query: string, p: SearchParams, limit: number) {
+  const filters = buildFilters(p);
   return sql<SearchResult[]>`
     select id, content, meta, tree::text as tree,
            -(content <@> to_bm25query(${query}, 'documents_content_bm25_idx')) as score
     from documents
     where content <@> to_bm25query(${query}, 'documents_content_bm25_idx') < 0
-      ${treeFilter(p)}
-      ${metaFilter(p)}
-      ${temporalFilter(p)}
-      ${nearFilter(p)}
+      ${filters}
     order by score desc
     limit ${limit}
   `;
 }
 
 async function semanticSearch(vec: number[], p: SearchParams, limit: number) {
+  const filters = buildFilters(p);
   const vecLit = `[${vec.join(',')}]`;
   const threshold = p.semanticThreshold ?? 0;
   return sql<SearchResult[]>`
@@ -92,26 +91,21 @@ async function semanticSearch(vec: number[], p: SearchParams, limit: number) {
     from documents
     where embedding is not null
       and (1 - (embedding <=> ${vecLit}::halfvec)) >= ${threshold}
-      ${treeFilter(p)}
-      ${metaFilter(p)}
-      ${temporalFilter(p)}
-      ${nearFilter(p)}
+      ${filters}
     order by embedding <=> ${vecLit}::halfvec
     limit ${limit}
   `;
 }
 
 async function filterOnly(p: SearchParams, limit: number) {
+  const filters = buildFilters(p);
   if (p.near) {
     const { lon, lat } = p.near;
     return sql<SearchResult[]>`
       select id, content, meta, tree::text as tree, 1.0::float as score
       from documents
       where geom is not null
-        ${treeFilter(p)}
-        ${metaFilter(p)}
-        ${temporalFilter(p)}
-        ${nearFilter(p)}
+        ${filters}
       order by geom <-> ST_SetSRID(ST_MakePoint(${lon}, ${lat}), 4326)
       limit ${limit}
     `;
@@ -120,48 +114,31 @@ async function filterOnly(p: SearchParams, limit: number) {
     select id, content, meta, tree::text as tree, 1.0::float as score
     from documents
     where true
-      ${treeFilter(p)}
-      ${metaFilter(p)}
-      ${temporalFilter(p)}
-      ${nearFilter(p)}
+      ${filters}
     order by created_at desc
     limit ${limit}
   `;
 }
 
-// --- Filter fragments ---
-// Each returns a `sql` fragment that is either empty or an `and …` predicate.
-
-function treeFilter(p: SearchParams) {
-  if (!p.tree) return sql``;
-  return sql`and tree <@ ${p.tree}::ltree`;
-}
-
-function metaFilter(p: SearchParams) {
-  if (!p.meta || Object.keys(p.meta).length === 0) return sql``;
-  // postgres-js auto-serializes objects to JSON when cast to ::jsonb.
-  // Calling JSON.stringify() ourselves double-encodes (the JSON becomes a
-  // quoted string value), so pass the object directly.
-  return sql`and meta @> ${p.meta as any}::jsonb`;
-}
-
-function temporalFilter(p: SearchParams) {
-  if (!p.temporal) return sql``;
-  const { from, to } = p.temporal;
-  if (from && to) return sql`and temporal && tstzrange(${from}::timestamptz, ${to}::timestamptz, '[)')`;
-  if (from)       return sql`and upper(temporal) > ${from}::timestamptz`;
-  if (to)         return sql`and lower(temporal) < ${to}::timestamptz`;
-  return sql``;
-}
-
-function nearFilter(p: SearchParams) {
-  if (!p.near) return sql``;
-  const { lon, lat, radiusMeters } = p.near;
-  return sql`and ST_DWithin(
-    geom::geography,
-    ST_SetSRID(ST_MakePoint(${lon}, ${lat}), 4326)::geography,
-    ${radiusMeters}
-  )`;
+function buildFilters(p: SearchParams) {
+  const parts: any[] = [];
+  if (p.tree) parts.push(sql`and tree <@ ${p.tree}::ltree`);
+  // Pass the meta object directly — postgres-js auto-serializes for ::jsonb.
+  // Calling JSON.stringify() double-encodes and matches nothing.
+  if (p.meta && Object.keys(p.meta).length > 0) parts.push(sql`and meta @> ${p.meta as any}::jsonb`);
+  if (p.temporal) {
+    const { from, to } = p.temporal;
+    if (from && to) parts.push(sql`and temporal && tstzrange(${from}::timestamptz, ${to}::timestamptz, '[)')`);
+    else if (from)  parts.push(sql`and upper(temporal) > ${from}::timestamptz`);
+    else if (to)    parts.push(sql`and lower(temporal) < ${to}::timestamptz`);
+  }
+  if (p.near) parts.push(sql`
+    and ST_DWithin(
+      geom::geography,
+      ST_SetSRID(ST_MakePoint(${p.near.lon}, ${p.near.lat}), 4326)::geography,
+      ${p.near.radiusMeters}
+    )`);
+  return parts.length > 0 ? sql`${parts}` : sql``;
 }
 
 async function fetchByIds(ids: string[]) {

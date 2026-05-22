@@ -35,24 +35,31 @@ async function processBatch(): Promise<number> {
     maxRetries: 5,
   });
 
-  for (let i = 0; i < claimed.length; i++) {
-    const row = claimed[i];
-    const vec = `[${embeddings[i].join(',')}]`;
+  // Bulk writeback — one round trip for the whole batch. See TUTORIAL_ISSUES #2.
+  const ids       = claimed.map(r => r.document_id);
+  const versions  = claimed.map(r => r.embedding_version);
+  const queueIds  = claimed.map(r => r.queue_id);
+  const vecs      = embeddings.map(e => `[${e.join(',')}]`);
 
-    const updated = await sql`
-      update documents
-      set embedding = ${vec}::halfvec
-      where id = ${row.document_id}
-        and embedding_version = ${row.embedding_version}
-      returning id
-    `;
-
-    if (updated.length === 0) {
-      await sql`update embedding_queue set outcome = 'cancelled' where id = ${row.queue_id}`;
-    } else {
-      await sql`update embedding_queue set outcome = 'completed' where id = ${row.queue_id}`;
-    }
-  }
+  await sql`
+    with input as (
+      select * from unnest(
+        ${ids}::uuid[], ${versions}::int[], ${queueIds}::bigint[], ${vecs}::text[]
+      ) as t(doc_id, ver, q_id, vec)
+    ),
+    upd as (
+      update documents d
+         set embedding = i.vec::halfvec
+        from input i
+       where d.id = i.doc_id and d.embedding_version = i.ver
+      returning d.id, i.q_id
+    )
+    update embedding_queue eq
+       set outcome = case when upd.q_id is null then 'cancelled' else 'completed' end
+      from input i
+      left join upd on upd.q_id = i.q_id
+     where eq.id = i.q_id
+  `;
   return claimed.length;
 }
 

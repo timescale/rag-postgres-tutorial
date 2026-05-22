@@ -41,12 +41,12 @@ PostgreSQL 18 with these extensions:
 create extension if not exists vector;        -- pgvector: halfvec, HNSW
 create extension if not exists ltree;         -- hierarchical paths
 create extension if not exists postgis;       -- geospatial types and indexes
-create extension if not exists pg_search;     -- BM25
+create extension if not exists pg_textsearch; -- BM25
 ```
 
 > `halfvec` is 16-bit floats (2 bytes/dim) instead of `vector`'s 32-bit floats. Half the storage, indistinguishable recall for embedding models like `text-embedding-3-small`. Always prefer it.
 
-If you want a hosted service, use [Tigerdata](https://tigerdata.com) or [ghost.build](https://ghost.build) — they're the only managed Postgres providers that ship `pg_search`. Other hosts will leave you stuck on `tsvector`/`tsquery`, which works but is materially worse than BM25 for ranking quality. If you're experimenting or doing AI-assisted development, prefer ghost.build: it has a generous free tier and its MCP server is purpose-built for agentic workflows, so Claude/Cursor can provision databases, run queries, and inspect schemas without you leaving the editor.
+If you want a hosted service, use [Tigerdata](https://tigerdata.com) or [ghost.build](https://ghost.build) — they're the only managed Postgres providers that ship `pg_textsearch` (Tiger Data's BM25 extension, used throughout this post). Other hosts will leave you stuck on `tsvector`/`tsquery`, which works but is materially worse than BM25 for ranking quality. If you're experimenting or doing AI-assisted development, prefer ghost.build: it has a generous free tier and its MCP server is purpose-built for agentic workflows, so Claude/Cursor can provision databases, run queries, and inspect schemas without you leaving the editor.
 
 ## Step 1 — The schema
 
@@ -324,6 +324,8 @@ Why each piece matters:
 - **The reap step** finalizes jobs whose worker crashed mid-write. Without this, the row gets reclaimed forever.
 - **The version recheck inside the loop** catches the race where content changed between enqueue and claim. The worker would otherwise produce an embedding for stale text.
 
+The function is written in imperative PL/pgSQL (a `FOR` loop with `RETURN NEXT`) rather than the more common `RETURN QUERY` form. That's deliberate: the per-row guards (document-still-exists, version-still-matches, claim-update) need to run inside the loop, between the `SELECT ... FOR UPDATE SKIP LOCKED` and the `RETURN NEXT`. Refactoring to a single `RETURN QUERY SELECT ...` collapses those guards into the planner's order of operations and breaks the version-race correctness.
+
 ## Step 5 — The worker
 
 The worker is a process (or several) that loops, claims batches, generates embeddings, writes them back. The shape:
@@ -352,26 +354,34 @@ async function processBatch() {
     maxRetries: 5,
   });
 
-  // 3. Write back, version-guarded
-  for (let i = 0; i < claimed.length; i++) {
-    const row = claimed[i];
-    const vec = `[${embeddings[i].join(',')}]`;
+  // 3. Write back in a single round trip, version-guarded.
+  // A naive per-row writeback (2 UPDATEs × batch size) is the throughput
+  // ceiling on a cloud DB — at 50–80ms RTT and batch 256, ~25–40s/batch
+  // is just waiting on the network. Bulk it with `unnest`:
+  const ids       = claimed.map(r => r.document_id);
+  const versions  = claimed.map(r => r.embedding_version);
+  const queueIds  = claimed.map(r => r.queue_id);
+  const vecs      = embeddings.map(e => `[${e.join(',')}]`);
 
-    const updated = await sql`
-      update documents
-      set embedding = ${vec}::halfvec
-      where id = ${row.document_id}
-        and embedding_version = ${row.embedding_version}
-      returning id
-    `;
-
-    if (updated.length === 0) {
-      // Content changed between claim and write — cancel the job
-      await sql`update embedding_queue set outcome = 'cancelled' where id = ${row.queue_id}`;
-    } else {
-      await sql`update embedding_queue set outcome = 'completed' where id = ${row.queue_id}`;
-    }
-  }
+  await sql`
+    with input as (
+      select * from unnest(
+        ${ids}::uuid[], ${versions}::int[], ${queueIds}::bigint[], ${vecs}::text[]
+      ) as t(doc_id, ver, q_id, vec)
+    ),
+    upd as (
+      update documents d
+         set embedding = i.vec::halfvec
+        from input i
+       where d.id = i.doc_id and d.embedding_version = i.ver
+      returning d.id, i.q_id
+    )
+    update embedding_queue eq
+       set outcome = case when upd.q_id is null then 'cancelled' else 'completed' end
+      from input i
+      left join upd on upd.q_id = i.q_id
+     where eq.id = i.q_id
+  `;
 
   return claimed.length;
 }
@@ -437,7 +447,7 @@ Add a threshold for noisy corpora:
 
 ### 6c. Hybrid search (RRF)
 
-Run BM25 and vector queries in parallel (one DB roundtrip each), then fuse with Reciprocal Rank Fusion:
+Run the BM25 query from 6a and the vector query from 6b in parallel (one DB roundtrip each — `Promise.all` from the application; do **not** try to combine them into a single SQL query, since each one needs its own `ORDER BY` and `LIMIT` to get a ranked candidate list). Then fuse the two ranked lists with Reciprocal Rank Fusion in application code:
 
 ```typescript
 function rrfFusion(
@@ -464,13 +474,17 @@ function rrfFusion(
 }
 ```
 
-Then fetch the top N rows by ID, preserving order with `array_position`:
+Then fetch the top N rows by ID, preserving the fused rank with `array_position`:
 
 ```sql
 select * from documents
 where id = any($1::uuid[])
 order by array_position($1::uuid[], id);
 ```
+
+(Without `array_position`, `id = any(...)` returns rows in whatever order Postgres picks — usually primary-key order — and your carefully fused ranking gets shuffled. This is the bug everyone hits the first time they write this query.)
+
+The full glue (parallel candidate queries → RRF → ordered re-fetch) is in [`searchDocuments`](#6h-searchdocuments--putting-it-all-together) below.
 
 Why RRF? It works without normalizing BM25 and cosine scores (which live on incompatible scales). It uses rank, not score magnitude. `k=60` is the value from the original Cormack et al. paper and is robust across query types.
 
@@ -622,6 +636,7 @@ interface SearchParams {
   fulltext?: string;                // BM25 query
   tree?: string;                    // ltree filter
   meta?: Record<string, unknown>;   // JSONB containment
+  temporal?: { from?: string; to?: string };   // ISO timestamps, overlap with [from,to)
   near?: { lon: number; lat: number; radiusMeters: number };  // geo filter
   limit?: number;                   // final result count (default 10)
   candidateLimit?: number;          // per-mode candidates before fusion (default 30)
@@ -735,7 +750,15 @@ async function filterOnly(p: SearchParams, limit: number) {
 function buildFilters(p: SearchParams) {
   const parts = [];
   if (p.tree)                                   parts.push(sql`and tree <@ ${p.tree}::ltree`);
+  // Pass the meta object directly — postgres-js auto-serializes it for ::jsonb.
+  // Don't JSON.stringify it yourself: the result is double-encoded and matches nothing.
   if (p.meta && Object.keys(p.meta).length > 0) parts.push(sql`and meta @> ${p.meta}::jsonb`);
+  if (p.temporal) {
+    const { from, to } = p.temporal;
+    if (from && to) parts.push(sql`and temporal && tstzrange(${from}::timestamptz, ${to}::timestamptz, '[)')`);
+    else if (from)  parts.push(sql`and upper(temporal) > ${from}::timestamptz`);
+    else if (to)    parts.push(sql`and lower(temporal) < ${to}::timestamptz`);
+  }
   if (p.near) parts.push(sql`
     and ST_DWithin(
       geom::geography,
@@ -809,6 +832,11 @@ Combine with tree, meta, temporal, and near (geo) filters. Results scored 0-1.`,
         .describe('Tree filter. work.projects matches exactly; work.projects.* includes descendants'),
       meta: z.record(z.string(), z.any()).optional().nullable()
         .describe('JSONB containment filter'),
+      temporal: z.object({
+        from: z.string().optional().nullable(),
+        to:   z.string().optional().nullable(),
+      }).optional().nullable()
+        .describe('ISO timestamps; restrict to documents whose temporal range overlaps [from, to)'),
       near: z.object({
         lon: z.number(),
         lat: z.number(),
@@ -827,10 +855,11 @@ Combine with tree, meta, temporal, and near (geo) filters. Results scored 0-1.`,
     const results = await searchDocuments({
       semantic: args.semantic ?? undefined,
       fulltext: args.fulltext ?? undefined,
-      tree: args.tree ?? undefined,
-      meta: args.meta ?? undefined,
-      near: args.near ?? undefined,
-      limit: args.limit && args.limit > 0 ? args.limit : 10,
+      tree:     args.tree ?? undefined,
+      meta:     args.meta ?? undefined,
+      temporal: args.temporal ?? undefined,
+      near:     args.near ?? undefined,
+      limit:    args.limit && args.limit > 0 ? args.limit : 10,
     });
     return {
       content: [{ type: 'text', text: JSON.stringify(results, null, 2) }],
