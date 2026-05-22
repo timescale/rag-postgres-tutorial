@@ -4,14 +4,15 @@ Most RAG (retrieval-augmented generation) stacks today rope together three or fo
 
 And after all that work, what do you actually get? Three retrieval modes: BM25 keyword, vector semantic, and hybrid (RRF) over the two — plus metadata filtering if you're lucky and your vector store supports it. That's it. The moment you want to filter by "everything under `work.projects.acme`," or "documents authored last quarter," you're back to writing application code that pulls candidates from the vector store and re-filters them in memory — losing recall and paying for it twice.
 
-You don't need any of that. Modern Postgres has everything required for a top-shelf RAG retrieval layer: BM25 full-text search, vector similarity via HNSW, hierarchical paths, JSONB filters, and a real job queue. This post walks through how to design a single table that supports **six composable types of search**, plus asynchronous embedding generation, and exposes itself to AI agents through MCP:
+You don't need any of that. Modern Postgres has everything required for a top-shelf RAG retrieval layer: BM25 full-text search, vector similarity via HNSW, hierarchical paths, geospatial indexes, JSONB filters, and a real job queue. This post walks through how to design a single table that supports **seven composable types of search**, plus asynchronous embedding generation, and exposes itself to AI agents through MCP:
 
 1. **Text search (BM25)** — keyword and phrase matching, the classic search-engine signal.
 2. **Semantic search (vector)** — cosine similarity over embeddings via HNSW, for paraphrase and concept matching.
 3. **Hybrid search (RRF)** — Reciprocal Rank Fusion over BM25 and vector results, so the two cover for each other's failure modes.
 4. **Hierarchical search (ltree)** — path queries like `work.projects.acme.*`, with index support and no recursive CTEs.
 5. **Temporal search (tstzrange)** — point-in-time and range overlap queries against an indexed time column.
-6. **Metadata search (JSONB)** — containment and attribute filters over arbitrary structured fields.
+6. **Geospatial search (PostGIS)** — radius, polygon-containment, and nearest-neighbor queries on lat/lon points.
+7. **Metadata search (JSONB)** — containment and attribute filters over arbitrary structured fields.
 
 Every mode composes with every other in a single SQL query, with index support all the way down. No application-side post-filtering, no recall loss.
 
@@ -22,13 +23,13 @@ Everything below is portable — you can drop it into your own database today.
 A `documents` table with:
 
 - **Hybrid retrieval** — BM25 keyword search + vector similarity, fused with Reciprocal Rank Fusion (RRF)
-- **Filters** — JSONB metadata, hierarchical `ltree` paths, time-range queries, regex grep
+- **Filters** — JSONB metadata, hierarchical `ltree` paths, time-range queries, PostGIS geometry, regex grep
 - **Background embedding** — a transactional outbox queue + a worker that calls OpenAI/Ollama/whatever
 - **MCP server** — agent-facing tools that wrap the SQL
 
 We'll write straight SQL plus a few hundred lines of TypeScript. No ORMs, no external vector DB.
 
-> **A note on scope.** What follows is the *maximal* schema — every column, index, and trigger needed to support all six search types. Real corpora rarely need all of them. If your documents have no hierarchy, drop the `tree` column and its GiST index. If nothing is time-bounded, drop `temporal`. If you only ever do semantic search, drop the BM25 index. The pieces are independent; treat this post as a menu, not a prescription.
+> **A note on scope.** What follows is the *maximal* schema — every column, index, and trigger needed to support all seven search types. Real corpora rarely need all of them. If your documents have no hierarchy, drop the `tree` column and its GiST index. If nothing is time-bounded, drop `temporal`. If nothing has a location, drop `geom` and the `postgis` extension. If you only ever do semantic search, drop the BM25 index. The pieces are independent; treat this post as a menu, not a prescription.
 
 ## Prerequisites
 
@@ -37,6 +38,7 @@ PostgreSQL 18 with these extensions:
 ```sql
 create extension if not exists vector;        -- pgvector: halfvec, HNSW
 create extension if not exists ltree;         -- hierarchical paths
+create extension if not exists postgis;       -- geospatial types and indexes
 create extension if not exists pg_search;     -- BM25
 ```
 
@@ -54,6 +56,7 @@ create table documents
 , meta                jsonb         not null default '{}'                 -- arbitrary attrs
 , tree                ltree         not null default ''::ltree            -- hierarchical path
 , temporal            tstzrange                                           -- optional time range
+, geom                geometry(Point, 4326)                               -- optional WGS84 point
 , embedding           halfvec(1536)                                       -- nullable until embedded
 , embedding_version   int           not null default 1                    -- bumps on content change
 , embedding_attempts  int           not null default 0
@@ -80,10 +83,11 @@ A few decisions worth explaining:
 - **`embedding_version` enforces correctness.** When content changes, this number ticks. The worker only writes back if the version still matches what it claimed — otherwise it would clobber a fresh row with a stale vector.
 - **`tree` (ltree) instead of `parent_id`.** Path queries (`work.projects.acme.notes <@ work.projects`) are O(log n) and don't need recursive CTEs. Patterns (`*.api.*`) and label queries (`api & v2`) are first-class.
 - **`temporal` (tstzrange) is optional.** Point-in-time events (`[t,t]`) and date ranges (`[start,end)`) live in the same column with the same operators.
+- **`geom` is a `geometry(Point, 4326)`.** SRID 4326 is WGS84 lat/lon — what GPS, OpenStreetMap, and basically every web map use. Store coordinates as `ST_SetSRID(ST_MakePoint(lon, lat), 4326)`. Note the order: PostGIS is `(longitude, latitude)`, not `(latitude, longitude)` — getting this wrong is the #1 PostGIS bug.
 
 ## Step 2 — The indexes
 
-Five indexes, each justified:
+Six indexes, each justified:
 
 ```sql
 -- JSONB attribute lookups: meta @> '{"type":"email"}'
@@ -98,6 +102,11 @@ create index documents_tree_gist_idx
 create index documents_temporal_gist_idx
   on documents using gist (temporal)
   where temporal is not null;
+
+-- Geospatial: ST_DWithin, ST_Intersects, <-> (kNN)
+create index documents_geom_gist_idx
+  on documents using gist (geom)
+  where geom is not null;
 
 -- BM25 full-text: content <@> to_bm25query(...)
 create index documents_content_bm25_idx
@@ -507,7 +516,46 @@ where temporal && tstzrange($1, $2, '[)');
 
 `@>` is "contains," `&&` is "overlaps." Both use the GiST index on `temporal`. This composes with the other modes: a hybrid search restricted to "documents valid as of yesterday" is just `... and temporal @> '2026-05-21'::timestamptz` added to the BM25 and vector queries.
 
-### 6f. Metadata search (JSONB)
+### 6f. Geospatial search (PostGIS)
+
+Three flavors, all backed by the GiST index on `geom`:
+
+```sql
+-- 1. Radius: documents within 5km of a point (cast to geography for meters)
+select id, content
+from documents
+where ST_DWithin(
+        geom::geography,
+        ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography,  -- ($1=lon, $2=lat)
+        5000                                                 -- meters
+      );
+
+-- 2. Polygon containment: documents inside an arbitrary shape
+select id, content
+from documents
+where ST_Intersects(geom, ST_GeomFromGeoJSON($1));
+
+-- 3. Nearest-neighbor: the 10 closest documents to a point
+select id, content,
+       ST_Distance(geom::geography, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography) as meters
+from documents
+where geom is not null
+order by geom <-> ST_SetSRID(ST_MakePoint($1, $2), 4326)
+limit 10;
+```
+
+A few traps worth knowing:
+
+- **`geometry` vs `geography`.** `geometry` uses planar math (fast, but distances near the poles are wrong); `geography` uses spheroidal math (slower, but distances are real meters). Store as `geometry` (smaller, faster indexes) and cast to `::geography` whenever you need real-world distances. `ST_DWithin(geog, geog, meters)` is the canonical radius query.
+- **`<->` is the kNN operator.** It uses the GiST index to walk nodes in distance order. This is the only PostGIS operator that gives you index-backed ordering — every other distance query is a scan with a sort. Use `<->` whenever you want "nearest N."
+- **Coordinate order is `(lon, lat)`.** Worth repeating.
+
+Two caveats on composition:
+
+- **The geo *filter* composes with everything.** `ST_DWithin(...)` or `ST_Intersects(...)` slots into the `where` clause of any BM25 or vector query — it just restricts the candidate set before ranking. The planner picks whether to start from the geo index or the text/vector index based on selectivity.
+- **The kNN *operator* (`<->`) does not compose with text or vector ranking.** It's an `ORDER BY` operator, and a query has only one primary sort. So you can rank by BM25 *or* cosine *or* distance, not all three. The `searchDocuments` function in 6h handles this by using `<->` only when geo is the *sole* signal; when text or vector is also present, it falls back to `ST_DWithin` as a filter and lets the text/vector score drive ordering.
+
+### 6g. Metadata search (JSONB)
 
 Containment filters on arbitrary structured attributes:
 
@@ -544,6 +592,9 @@ from documents
 where content <@> to_bm25query($1, 'documents_content_bm25_idx') < 0
   and tree <@ 'work.projects.acme'::ltree
   and temporal && tstzrange($2, $3, '[)')
+  and ST_DWithin(geom::geography,
+                 ST_SetSRID(ST_MakePoint($4, $5), 4326)::geography,
+                 $6)
   and meta @> '{"status": "published"}'::jsonb
 order by score desc
 limit 30;
@@ -551,7 +602,7 @@ limit 30;
 
 Every clause has an index available; the planner decides which to use and where to apply remaining predicates as filters. Either way, the filtering happens in the database, not in your application — no recall loss from pre-filtering a vector store with the wrong candidate set, no fetch-then-discard round trips.
 
-### 6g. `searchDocuments` — putting it all together
+### 6h. `searchDocuments` — putting it all together
 
 The MCP server in Step 7 calls a single `searchDocuments` function. Here's the implementation that ties the modes together:
 
@@ -569,6 +620,7 @@ interface SearchParams {
   fulltext?: string;                // BM25 query
   tree?: string;                    // ltree filter
   meta?: Record<string, unknown>;   // JSONB containment
+  near?: { lon: number; lat: number; radiusMeters: number };  // geo filter
   limit?: number;                   // final result count (default 10)
   candidateLimit?: number;          // per-mode candidates before fusion (default 30)
   semanticThreshold?: number;       // min cosine similarity (0-1)
@@ -656,6 +708,17 @@ async function semanticSearch(vec: number[], p: SearchParams, limit: number) {
 
 async function filterOnly(p: SearchParams, limit: number) {
   const filters = buildFilters(p);
+  // If a geo anchor is given with no text/vector query, sort by distance using
+  // the kNN operator — it walks the GiST index in distance order.
+  if (p.near) {
+    return sql<SearchResult[]>`
+      select id, content, meta, tree::text, 1.0::float as score
+      from documents
+      where geom is not null ${filters}
+      order by geom <-> ST_SetSRID(ST_MakePoint(${p.near.lon}, ${p.near.lat}), 4326)
+      limit ${limit}
+    `;
+  }
   return sql<SearchResult[]>`
     select id, content, meta, tree::text, 1.0::float as score
     from documents
@@ -671,6 +734,12 @@ function buildFilters(p: SearchParams) {
   const parts = [];
   if (p.tree)                                   parts.push(sql`and tree <@ ${p.tree}::ltree`);
   if (p.meta && Object.keys(p.meta).length > 0) parts.push(sql`and meta @> ${p.meta}::jsonb`);
+  if (p.near) parts.push(sql`
+    and ST_DWithin(
+      geom::geography,
+      ST_SetSRID(ST_MakePoint(${p.near.lon}, ${p.near.lat}), 4326)::geography,
+      ${p.near.radiusMeters}
+    )`);
   return parts.length > 0 ? sql`${parts}` : sql``;
 }
 
@@ -728,7 +797,7 @@ server.registerTool(
 
 Modes: semantic (meaning), fulltext (keywords), or both (hybrid).
 For ordinary queries, set both semantic and fulltext to the same query string.
-Combine with tree, meta, and temporal filters. Results scored 0-1.`,
+Combine with tree, meta, temporal, and near (geo) filters. Results scored 0-1.`,
     inputSchema: {
       semantic: z.string().optional().nullable()
         .describe('Natural language query for vector search'),
@@ -738,6 +807,12 @@ Combine with tree, meta, and temporal filters. Results scored 0-1.`,
         .describe('Tree filter. work.projects matches exactly; work.projects.* includes descendants'),
       meta: z.record(z.string(), z.any()).optional().nullable()
         .describe('JSONB containment filter'),
+      near: z.object({
+        lon: z.number(),
+        lat: z.number(),
+        radiusMeters: z.number(),
+      }).optional().nullable()
+        .describe('Geo filter: restrict to documents within radiusMeters of (lon, lat). With no other query, results are sorted by distance.'),
       limit: z.number().int().optional().nullable()
         .describe('Maximum results (default 10, max 1000)'),
     },
@@ -752,6 +827,7 @@ Combine with tree, meta, and temporal filters. Results scored 0-1.`,
       fulltext: args.fulltext ?? undefined,
       tree: args.tree ?? undefined,
       meta: args.meta ?? undefined,
+      near: args.near ?? undefined,
       limit: args.limit && args.limit > 0 ? args.limit : 10,
     });
     return {
@@ -778,7 +854,8 @@ For write operations (insert/update/delete), register additional tools with `rea
 In a single Postgres table:
 
 - Full-text + semantic + hybrid search with first-class scoring
-- JSONB, hierarchical-path, and temporal-range filters that compose with search
+- JSONB, hierarchical-path, temporal-range, and geospatial filters that compose with search
+- Index-backed nearest-neighbor queries via PostGIS `<->`
 - Asynchronous embedding generation that survives crashes, races, and rate limits
 - A transactional guarantee — writes don't depend on the embedding provider being up
 - A scaleable worker pool with no coordination overhead (just run more processes)
