@@ -30,6 +30,8 @@ A `documents` table with:
 We'll write straight SQL plus a few hundred lines of TypeScript. No ORMs, no external vector DB.
 
 > **A note on scope.** What follows is the *maximal* schema — every column, index, and trigger needed to support all seven search types. Real corpora rarely need all of them. If your documents have no hierarchy, drop the `tree` column and its GiST index. If nothing is time-bounded, drop `temporal`. If nothing has a location, drop `geom` and the `postgis` extension. If you only ever do semantic search, drop the BM25 index. The pieces are independent; treat this post as a menu, not a prescription.
+>
+> We also assume **`content` is already chunked**. One row holds the unit of text you want to retrieve — a paragraph, a section, a comment, a 311 complaint description, whatever your chunking strategy produces. Chunking itself (sliding window, markdown-aware, semantic) is upstream of this schema; see "Going further" for the pattern of linking chunks back to a parent via `meta`.
 
 ## Prerequisites
 
