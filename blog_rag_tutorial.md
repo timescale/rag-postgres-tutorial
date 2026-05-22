@@ -911,6 +911,42 @@ In a single Postgres table:
 
 No Pinecone bill, no Elasticsearch cluster, no Kafka, no separate sync code. Just `documents`.
 
+## Iterating with evals
+
+Retrieval has a lot of knobs. Chunk size, the shape of the denormalized `content` blob, the `tree` schema, BM25 `k1` and `b`, HNSW `ef_construction`, the RRF weights, the MCP tool description the LLM reads to decide *what* to call — all of them affect what the agent finds, and a change that improves one query class can silently regress another. The only honest answer to "is this better?" is an eval.
+
+### A minimum viable eval set
+
+You don't need a benchmark. You need maybe 30–100 `(question, expected_doc_ids)` pairs that represent the queries your agent actually has to handle. The cheap way to bootstrap:
+
+1. Take a sample of real user questions (or synthesize them — give an LLM 20 random rows and ask "what question would this be the right answer to?").
+2. For each one, mark the doc IDs that *should* be in the top 10 — usually 1–3 per question.
+3. Cover the modes you care about: lexical (rare names, identifiers), conceptual (paraphrase), filtered (subtree-restricted, time-windowed, geo-anchored), and compositional (hybrid + filter + filter).
+
+Score with recall@10 and MRR — both are one-liners over the returned `id` lists. Keep the eval set in a `.jsonl` alongside the code; check it in.
+
+### Optimizing with an autoresearch loop
+
+Once you have an eval, the natural next step is to put another agent in front of it: an outer loop that *proposes changes*, applies them, runs the eval, and keeps the ones that win. The interesting axes to vary are exactly the ones that are hard to reason about a priori:
+
+- **MCP tool description.** The single biggest lever for tool-using agents. Reword the modes, list the actual `meta` keys, give example `tree` paths, clarify what `near` means in this corpus. The model's call patterns shift accordingly.
+- **`content` text shape.** What you concatenate into the retrieval unit changes both BM25 (term presence) and the embedding (what the vector represents). Try descriptor-first vs. address-first; include or exclude the resolution; collapse whitespace; add or drop section headers.
+- **`tree` layout.** `nyc.<borough>.<agency>.<complaint_type>` vs. `nyc.<agency>.<borough>.<complaint_type>` vs. `nyc.<complaint_type>.<borough>` are all valid — but only one of them lets the agent express the queries it actually needs to express with one subtree filter.
+- **Chunking strategy.** Sliding window size, overlap, whether to split on markdown headers vs. sentence boundaries.
+- **BM25 / HNSW / RRF tuning.** `k1`, `b`, `ef_search`, RRF `k`, the per-mode weights.
+- **Reranker on/off**, **embedding model swap**, **threshold settings**.
+
+The bottleneck in a loop like this is normally the database. A real schema change ("re-chunk everything," "rebuild the BM25 index with `k1=2.0`," "add a new ltree column") means: provision a fresh DB, copy the data, re-embed (the expensive part — minutes to hours), rebuild indexes, then run the eval. Doing that sequentially per candidate is so slow that most teams give up and just ship the first thing that works.
+
+Ghost's database forking changes the shape of this loop. A fork is a fully independent database created from a snapshot of the source — *including the embeddings*. Spinning one up takes seconds, not the half-hour an `embedMany` backfill of a real corpus would take. So the outer agent can:
+
+1. Fork the production DB.
+2. Apply the candidate change (`ALTER TABLE`, re-chunk and re-embed only the affected rows, edit the MCP description).
+3. Re-run the eval set against the fork.
+4. Keep the fork on win; throw it away on loss.
+
+Iteration cost drops from "provision-and-backfill minutes" to "eval-runtime seconds," and the inner loop becomes bounded by how fast the eval itself runs — usually a few seconds, since it's just N MCP calls in parallel. That's the difference between "we'll get to tuning the description next quarter" and "we tried 40 variants this afternoon."
+
 ## Going further
 
 A few avenues once the basics are in:
