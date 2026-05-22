@@ -29,7 +29,11 @@ A `documents` table with:
 
 We'll write straight SQL plus a few hundred lines of TypeScript. No ORMs, no external vector DB.
 
-> **A note on scope.** What follows is the *maximal* schema — every column, index, and trigger needed to support all seven search types. Real corpora rarely need all of them. If your documents have no hierarchy, drop the `tree` column and its GiST index. If nothing is time-bounded, drop `temporal`. If nothing has a location, drop `geom` and the `postgis` extension. If you only ever do semantic search, drop the BM25 index. The pieces are independent; treat this post as a menu, not a prescription.
+> **A note on scope.** What follows is the *maximal* schema — every column, index, and trigger needed to support all seven search types. Real corpora rarely match it exactly; treat this post as a guide for shaping your own schema, not a literal prescription.
+>
+> - **Drop the pieces you don't need.** No hierarchy → drop `tree` and its GiST index. Nothing time-bounded → drop `temporal`. Nothing with a location → drop `geom` and the `postgis` extension. Semantic-only → drop the BM25 index.
+> - **Add the pieces your corpus has more than one of.** A single `temporal` column captures one notion of time; a real corpus often has several (event time vs. validity window vs. ingestion time, or `created_at` vs. `closed_at` for support tickets). Add one indexed column per notion — they don't conflict, and the agent can filter on whichever the question is about. Same for location: incident location vs. reporter location vs. service-area polygon are different columns with different indexes, not one overloaded `geom`. Same for `tree` if you have orthogonal hierarchies (e.g. organizational structure *and* product taxonomy).
+> - **Rename for the domain.** `meta` and `content` are placeholders; if your corpus is support tickets, call them `body` and `attributes`; if it's 311 service requests, call the columns what they actually are. The MCP description (Step 7) is what the LLM reads — naming columns concretely is half of that work.
 >
 > We also assume **`content` is already chunked**. One row holds the unit of text you want to retrieve — a paragraph, a section, a comment, a 311 complaint description, whatever your chunking strategy produces. Chunking itself (sliding window, markdown-aware, semantic) is upstream of this schema; see "Going further" for the pattern of linking chunks back to a parent via `meta`.
 
@@ -874,7 +878,12 @@ Three details that matter:
 
 - **All inputs are optional and nullable.** The MCP SDK has historically struggled with strict schemas. Make every field `.optional().nullable()` and unwrap `null → undefined` in the handler. Saves hours of debugging.
 - **`readOnlyHint: true` and `idempotentHint: true`** let the host (Claude, Cursor) batch and cache calls and skip permission prompts.
-- **Write a long description.** This is the only documentation the LLM reads to decide whether to call your tool. List the modes, the filter syntax, the score scale. The model's tool-selection quality is roughly proportional to description quality.
+- **Write a long description, and tailor it to your actual corpus.** This is the only documentation the LLM reads to decide whether to call your tool. List the modes, the filter syntax, the score scale. The model's tool-selection quality is roughly proportional to description quality. The description above is generic on purpose — for your data, replace every abstract reference with the concrete shape:
+  - **`meta`** — list the JSONB keys the agent can actually filter on and their value spaces (e.g. `agency` ∈ {`NYPD`, `DOT`, `DSNY`, …}, `status` ∈ {`Open`, `In Progress`, `Closed`}). Without this, the agent will guess key names that don't exist.
+  - **`tree`** — show the real path schema (e.g. `nyc.<borough>.<agency>.<complaint_type>`), with a couple of example paths, so the agent knows what level to filter at.
+  - **`near`** — say what a location *is* in this corpus (the incident address? the reporter's address? a service area centroid?) and what coordinate system it's in. "A point" is not enough.
+  - **`temporal`** — say what the range *means* (event time? validity window? `[created_at, closed_at)`?), because the same query against `created_at` vs. `closed_at` returns very different sets.
+  - **`fulltext` / `semantic`** — say what `content` contains (the descriptor, the resolution, the address, all concatenated?), so the agent knows whether to expect a name match, a free-text paraphrase, or both.
 
 Wire up the MCP server in your client's config (e.g. `~/.config/claude/mcp.json`) and the agent can now retrieve from your database.
 
