@@ -1,0 +1,25 @@
+{
+  "name": "demo-311",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "load": "tsx src/load.ts",
+    "worker": "tsx src/worker.ts",
+    "search": "tsx src/search-cli.ts",
+    "mcp": "tsx src/mcp-server.ts"
+  },
+  "dependencies": {
+    "@ai-sdk/openai": "^1.3.0",
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "ai": "^4.1.0",
+    "dotenv": "^16.4.5",
+    "postgres": "^3.4.5",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}

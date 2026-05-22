@@ -425,7 +425,7 @@ order by score desc, created_at desc
 limit 30;
 ```
 
-`<@>` returns BM25 distance (lower is better). Negating it gives a similarity score, which sorts nicely. Use BM25 when the query contains names, code identifiers, exact phrases, or rare terminology where lexical match matters.
+`<@>` returns BM25 *distance*, which `pg_textsearch` encodes as a non-positive number: matches come back as negative values (more negative = better match), and rows that don't match at all return `0`. That's why the `where` clause filters on `< 0` — it's the predicate that excludes non-matches, not just a cosmetic threshold. Negating the distance in the `select` flips it into a positive similarity score that sorts naturally with `order by score desc`. Use BM25 when the query contains names, code identifiers, exact phrases, or rare terminology where lexical match matters.
 
 ### 6b. Semantic search (vector)
 
@@ -639,7 +639,7 @@ interface SearchParams {
   semantic?: string;                // natural language query
   fulltext?: string;                // BM25 query
   tree?: string;                    // ltree filter
-  meta?: Record<string, unknown>;   // JSONB containment
+  meta?: Record<string, any>;       // JSONB containment (must be JSON-serializable)
   temporal?: { from?: string; to?: string };   // ISO timestamps, overlap with [from,to)
   near?: { lon: number; lat: number; radiusMeters: number };  // geo filter
   limit?: number;                   // final result count (default 10)
@@ -754,9 +754,12 @@ async function filterOnly(p: SearchParams, limit: number) {
 function buildFilters(p: SearchParams) {
   const parts = [];
   if (p.tree)                                   parts.push(sql`and tree <@ ${p.tree}::ltree`);
-  // Pass the meta object directly — postgres-js auto-serializes it for ::jsonb.
-  // Don't JSON.stringify it yourself: the result is double-encoded and matches nothing.
-  if (p.meta && Object.keys(p.meta).length > 0) parts.push(sql`and meta @> ${p.meta}::jsonb`);
+  // `sql.json(...)` is the postgres-js helper for sending a plain object as a
+  // JSONB parameter; it's the form that type-checks against the library's
+  // `JSONValue` constraint. Don't JSON.stringify yourself — postgres-js will
+  // re-encode the string and you end up with a quoted JSON scalar that
+  // matches nothing.
+  if (p.meta && Object.keys(p.meta).length > 0) parts.push(sql`and meta @> ${sql.json(p.meta)}::jsonb`);
   if (p.temporal) {
     const { from, to } = p.temporal;
     if (from && to) parts.push(sql`and temporal && tstzrange(${from}::timestamptz, ${to}::timestamptz, '[)')`);
@@ -861,7 +864,12 @@ Combine with tree, meta, temporal, and near (geo) filters. Results scored 0-1.`,
       fulltext: args.fulltext ?? undefined,
       tree:     args.tree ?? undefined,
       meta:     args.meta ?? undefined,
-      temporal: args.temporal ?? undefined,
+      // `.nullable()` only strips the outer null; the inner fields are still
+      // `string | null | undefined`, so we have to unwrap them too.
+      temporal: args.temporal ? {
+        from: args.temporal.from ?? undefined,
+        to:   args.temporal.to   ?? undefined,
+      } : undefined,
       near:     args.near ?? undefined,
       limit:    args.limit && args.limit > 0 ? args.limit : 10,
     });
