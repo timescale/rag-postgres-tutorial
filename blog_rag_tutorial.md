@@ -33,7 +33,6 @@ We'll write straight SQL plus a few hundred lines of TypeScript. No ORMs, no ext
 >
 > - **Drop the pieces you don't need.** No hierarchy → drop `tree` and its GiST index. Nothing time-bounded → drop `temporal`. Nothing with a location → drop `geom` and the `postgis` extension. Semantic-only → drop the BM25 index.
 > - **Add the pieces your corpus has more than one of.** A single `temporal` column captures one notion of time; a real corpus often has several (event time vs. validity window vs. ingestion time, or `created_at` vs. `closed_at` for support tickets). Add one indexed column per notion — they don't conflict, and the agent can filter on whichever the question is about. Same for location: incident location vs. reporter location vs. service-area polygon are different columns with different indexes, not one overloaded `geom`. Same for `tree` if you have orthogonal hierarchies (e.g. organizational structure *and* product taxonomy).
-> - **Rename for the domain.** `meta` and `content` are placeholders; if your corpus is support tickets, call them `body` and `attributes`; if it's 311 service requests, call the columns what they actually are. The MCP description (Step 7) is what the LLM reads — naming columns concretely is half of that work.
 >
 > We also assume **`content` is already chunked**. One row holds the unit of text you want to retrieve — a paragraph, a section, a comment, a 311 complaint description, whatever your chunking strategy produces. Chunking itself (sliding window, markdown-aware, semantic) is upstream of this schema; see "Going further" for the pattern of linking chunks back to a parent via `meta`.
 
@@ -51,6 +50,8 @@ create extension if not exists pg_textsearch; -- BM25
 > `halfvec` is 16-bit floats (2 bytes/dim) instead of `vector`'s 32-bit floats. Half the storage, indistinguishable recall for embedding models like `text-embedding-3-small`. Always prefer it.
 
 If you want a hosted service, use [Tigerdata](https://tigerdata.com) or [ghost.build](https://ghost.build) — they're the only managed Postgres providers that ship `pg_textsearch` (Tiger Data's BM25 extension, used throughout this post). Other hosts will leave you stuck on `tsvector`/`tsquery`, which works but is materially worse than BM25 for ranking quality. If you're experimenting or doing AI-assisted development, prefer ghost.build: it has a generous free tier and its MCP server is purpose-built for agentic workflows, so Claude/Cursor can provision databases, run queries, and inspect schemas without you leaving the editor.
+
+For the worker, search, and MCP code (Steps 5–7), you'll want Node 20+ and the Vercel AI SDK — `ai@6` and `@ai-sdk/openai@3` are what the snippets are written against.
 
 ## Step 1 — The schema
 
@@ -83,6 +84,7 @@ alter table documents add constraint temporal_bounds_convention check (
 A few decisions worth explaining:
 
 - **One table or many?** Depends on whether you want to search across document types together or keep them separate. If a single query should be able to retrieve a blog post, an email, and a PDF in the same ranked result list, put them in one table and express the type in `meta->>'type'` — you get one set of indexes and one BM25/HNSW build to maintain. If the corpora are genuinely independent (different access patterns, different lifecycles, different embedding models), separate tables are fine and the same schema below still applies per-table.
+- **`id` is `uuidv7`.** The first 48 bits are a Unix-millisecond timestamp, so lexicographic order on `id` is creation order. `order by id desc` then gives newest-first *and* a deterministic tiebreak in one column — which Step 6 leans on, since BM25 scores tie heavily on structured corpora and `created_at` ties under bulk insert (a single `insert ... select` shares one `now()` timestamp across every row).
 - **`embedding` is nullable.** Writes don't block on calling OpenAI. The vector is filled in asynchronously by a worker (Step 4). This is the single most important design decision in the whole post.
 - **`embedding_version` enforces correctness.** When content changes, this number ticks. The worker only writes back if the version still matches what it claimed — otherwise it would clobber a fresh row with a stale vector.
 - **`tree` (ltree) instead of `parent_id`.** Path queries (`work.projects.acme.notes <@ work.projects`) are O(log n) and don't need recursive CTEs. Patterns (`*.api.*`) and label queries (`api & v2`) are first-class. Labels are restricted to `[A-Za-z0-9_]` (max 256 chars), so sanitize at write time — e.g. `"Noise - Residential"` has to become `noise_residential` or you'll get `syntax error in ltree`.
@@ -323,13 +325,14 @@ The worker is a process (or several) that loops, claims batches, generates embed
 
 ```typescript
 // worker.ts — pseudocode-ish, ~100 lines for the real thing
+import 'dotenv/config';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { embedMany } from 'ai';
 import { openai } from '@ai-sdk/openai';
 import postgres from 'postgres';
 
 const sql = postgres(process.env.DATABASE_URL!);
-const model = openai.textEmbeddingModel('text-embedding-3-small');
+const model = openai.embeddingModel('text-embedding-3-small');
 
 async function processBatch() {
   // 1. Claim
@@ -348,7 +351,7 @@ async function processBatch() {
   // 3. Write back in a single round trip, version-guarded.
   const ids       = claimed.map(r => r.document_id);
   const versions  = claimed.map(r => r.embedding_version);
-  const queueIds  = claimed.map(r => r.queue_id);
+  const queueIds  = claimed.map(r => r.queue_id);   // string — postgres.js encodes bigint as a JS string to avoid precision loss; pass through to ::bigint[], don't do arithmetic
   const vecs      = embeddings.map(e => `[${e.join(',')}]`);
 
   await sql`
@@ -406,7 +409,7 @@ select id, content,
        -(content <@> to_bm25query($1, 'documents_content_bm25_idx')) as score
 from documents
 where content <@> to_bm25query($1, 'documents_content_bm25_idx') < 0
-order by score desc, created_at desc
+order by score desc, id desc
 limit 30;
 ```
 
@@ -422,7 +425,7 @@ select id, content,
 from documents
 where embedding is not null
   and (embedding <=> $1::halfvec) < 1.0
-order by score desc, created_at desc
+order by score desc, id desc
 limit 30;
 ```
 
@@ -483,6 +486,20 @@ You can tune the weights when one signal is more reliable than the other for you
 
 **Prefer hybrid by default for free-text queries.** Vectors handle paraphrase and concept matching; BM25 handles names, code identifiers, exact phrases, and tail terminology. Either one alone has obvious failure modes; together they cover for each other.
 
+### A note on the next four modes
+
+Modes 6d–6g are filters, not rankers — they restrict which rows match, but
+don't produce a score to sort by. The convention used through this section
+is `order by id desc, limit 30`: return the most recent N matches,
+deterministically. The `limit` is required (without it a `select` returns
+the entire matching set, which can be huge); the `order by id desc` is what
+makes the `limit` meaningful (without it Postgres picks an arbitrary subset).
+We use `id desc` rather than `created_at desc` because `id` is uuidv7 — it's
+already time-ordered, fully unique, and doesn't tie under bulk insert.
+
+When a filter is composed with BM25 or vector search (Step 6h), the ranking
+signal drives the order instead and the `id desc` becomes the tiebreak.
+
 ### 6d. Hierarchical search (ltree)
 
 Restrict results to a subtree of the document hierarchy:
@@ -491,7 +508,7 @@ Restrict results to a subtree of the document hierarchy:
 select id, content, tree
 from documents
 where tree <@ 'work.projects.acme'::ltree   -- everything under work.projects.acme
-order by created_at desc
+order by id desc
 limit 30;
 ```
 
@@ -511,12 +528,16 @@ Find rows whose temporal extent overlaps or contains a moment or window:
 -- Documents whose validity range contains a specific instant
 select id, content
 from documents
-where temporal @> $1::timestamptz;
+where temporal @> $1::timestamptz
+order by id desc
+limit 30;
 
 -- Documents whose range overlaps a query window
 select id, content
 from documents
-where temporal && tstzrange($1, $2, '[)');
+where temporal && tstzrange($1, $2, '[)')
+order by id desc
+limit 30;
 ```
 
 `@>` is "contains," `&&` is "overlaps." Both use the GiST index on `temporal`. This composes with the other modes: a hybrid search restricted to "documents valid as of yesterday" is just `... and temporal @> '2026-05-21'::timestamptz` added to the BM25 and vector queries.
@@ -533,12 +554,16 @@ where ST_DWithin(
         geom::geography,
         ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography,  -- ($1=lon, $2=lat)
         5000                                                 -- meters
-      );
+      )
+order by id desc
+limit 30;
 
 -- 2. Polygon containment: documents inside an arbitrary shape
 select id, content
 from documents
-where ST_Intersects(geom, ST_GeomFromGeoJSON($1));
+where ST_Intersects(geom, ST_GeomFromGeoJSON($1))
+order by id desc
+limit 30;
 
 -- 3. Nearest-neighbor: the 10 closest documents to a point
 select id, content,
@@ -568,7 +593,7 @@ Containment filters on arbitrary structured attributes:
 select id, content
 from documents
 where meta @> '{"type": "email", "status": "sent"}'::jsonb
-order by created_at desc
+order by id desc
 limit 30;
 ```
 
@@ -601,7 +626,7 @@ where content <@> to_bm25query($1, 'documents_content_bm25_idx') < 0
                  ST_SetSRID(ST_MakePoint($4, $5), 4326)::geography,
                  $6)
   and meta @> '{"status": "published"}'::jsonb
-order by score desc
+order by score desc, id desc
 limit 30;
 ```
 
@@ -613,12 +638,13 @@ The MCP server in Step 7 calls a single `searchDocuments` function. Here's the i
 
 ```typescript
 // search.ts
+import 'dotenv/config';
 import postgres from 'postgres';
 import { embed } from 'ai';
 import { openai } from '@ai-sdk/openai';
 
 const sql = postgres(process.env.DATABASE_URL!);
-const embeddingModel = openai.textEmbeddingModel('text-embedding-3-small');
+const embeddingModel = openai.embeddingModel('text-embedding-3-small');
 
 interface SearchParams {
   semantic?: string;                // natural language query
@@ -691,7 +717,7 @@ async function bm25Search(query: string, p: SearchParams, limit: number) {
     from documents
     where content <@> to_bm25query(${query}, 'documents_content_bm25_idx') < 0
       ${filters}
-    order by score desc
+    order by score desc, id desc
     limit ${limit}
   `;
 }
@@ -707,7 +733,7 @@ async function semanticSearch(vec: number[], p: SearchParams, limit: number) {
     where embedding is not null
       and (1 - (embedding <=> ${vecLit}::halfvec)) >= ${threshold}
       ${filters}
-    order by embedding <=> ${vecLit}::halfvec
+    order by embedding <=> ${vecLit}::halfvec, id desc
     limit ${limit}
   `;
 }
@@ -729,7 +755,7 @@ async function filterOnly(p: SearchParams, limit: number) {
     select id, content, meta, tree::text, 1.0::float as score
     from documents
     where true ${filters}
-    order by created_at desc
+    order by id desc
     limit ${limit}
   `;
 }
