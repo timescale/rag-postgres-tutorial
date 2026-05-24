@@ -87,9 +87,11 @@ A few decisions worth explaining:
 - **`embedding` is `halfvec(1536)`.** `halfvec` is 16-bit floats (2 bytes/dim) instead of `vector`'s 32-bit floats — half the storage, indistinguishable recall for embedding models like `text-embedding-3-small`. Always prefer it.
 - **`embedding` is nullable.** Writes don't block on calling OpenAI. The vector is filled in asynchronously by a worker (Step 4). This is the single most important design decision in the whole post.
 - **`embedding_version` enforces correctness.** When content changes, this number ticks. The worker only writes back if the version still matches what it claimed — otherwise it would clobber a fresh row with a stale vector.
-- **`tree` (ltree) instead of `parent_id`.** Path queries (`work.projects.acme.notes <@ work.projects`) are O(log n) and don't need recursive CTEs. Patterns (`*.api.*`) and label queries (`api & v2`) are first-class. Labels are restricted to `[A-Za-z0-9_]` (max 256 chars), so sanitize at write time — e.g. `"Noise - Residential"` has to become `noise_residential` or you'll get `syntax error in ltree`.
+- **`tree` (ltree) instead of `parent_id`.** Path queries (`work.projects.acme.notes <@ work.projects`) are O(log n) and don't need recursive CTEs. Patterns (`*.api.*`) and label queries (`api & v2`) are first-class. Labels are restricted to `[A-Za-z0-9_]` (max 256 chars), so sanitize at write time — `s.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '')` turns `"Noise - Residential"` into `noise_residential`. Without this you'll get `syntax error in ltree`.
 - **`temporal` (tstzrange) is optional.** Point-in-time events (`[t,t]`), bounded ranges (`[start,end)`), and still-open ranges (`[start,'infinity')`) live in the same column with the same operators.
 - **`geom` is a `geometry(Point, 4326)`.** SRID 4326 is WGS84 lat/lon — what GPS, OpenStreetMap, and basically every web map use. Store coordinates as `ST_SetSRID(ST_MakePoint(lon, lat), 4326)`. Note the order: PostGIS is `(longitude, latitude)`, not `(latitude, longitude)` — getting this wrong is the #1 PostGIS bug.
+
+> **Loading data into this schema.** For bulk loads, use `COPY ... FROM STDIN`, which parses each field as the column's input type. If you need `ON CONFLICT` (or anything else that rules out COPY), pass the batch as one jsonb argument and unfold with `jsonb_array_elements(...)` server-side — never `${arr.map(JSON.stringify)}::jsonb[]`, which stores each element as a JSON string scalar (the same gotcha `buildFilters` warns about for query parameters).
 
 ## Step 2 — The indexes
 
@@ -410,19 +412,22 @@ async function processBatch() {
   return claimed.length;
 }
 
-// Main loop with adaptive polling
-async function run() {
+// Main loop with adaptive polling. Pass { oneShot: true } so the same script
+// doubles as an initial backfiller and exits when the queue drains.
+async function run({ oneShot = false } = {}) {
   while (true) {
     const n = await processBatch();
-    if (n === 0) await sleep(10_000);  // idle: 10s
-    // else loop immediately — there might be more work
+    if (n === 0) {
+      if (oneShot) return;
+      await sleep(10_000);  // idle: 10s
+    }
   }
 }
 ```
 
 The behaviors to get right:
 
-1. **Adaptive polling.** Loop immediately when you found work; sleep when idle. A worker that polls every 100ms when empty wastes the database.
+1. **Adaptive polling.** Loop immediately when you found work; sleep when idle. A worker that polls every 100ms when empty wastes the database. The `oneShot` flag lets the same script double as an initial backfiller — it returns on the first empty poll instead of sleeping.
 2. **Version-guarded writeback** (`where embedding_version = $3`). This is the safety net for the race against concurrent content edits.
 3. **Multiple workers, zero coordination.** Thanks to `SKIP LOCKED`, you can run 1 or 10 workers without changing any code. They'll partition the queue cleanly.
 4. **Batch size, and a single bulk writeback.** Against a cloud DB at ~50–80 ms RTT, 32–128 is the sweet spot for the claim batch — smaller batches leave the worker waiting on the network, larger batches hold the visibility lease too long if the claim raises mid-flight. The writeback itself has to be a *single* statement using `unnest` to fan out the per-row updates; a naive per-row writeback (2 UPDATEs × batch size) is the throughput ceiling on a cloud DB.
@@ -1019,6 +1024,7 @@ Iteration cost drops from "provision-and-backfill minutes" to "eval-runtime seco
 
 A few avenues once the basics are in:
 
+- **Bulk-loading an existing corpus.** For initial backfills, invert the order from the steady-state design: create the schema *without* the BM25 and HNSW indexes, `COPY` your rows in (embedding NULL), let the workers drain the queue, then `CREATE INDEX` BM25 and HNSW on the now-populated table. HNSW build time on a static table is materially lower than the sum of per-row upserts you'd incur with the index already in place, and the gap widens with corpus size. Keep the GIN/GiST indexes — they're cheap enough to build incrementally — or defer them too if you want every last second back.
 - **Chunking.** This post stores whole documents per row. For long content, chunk first (semantic, sliding-window, or markdown-aware) and store one row per chunk, with `meta->>'parent_id'` linking back to the source. Search retrieves chunks; the LLM gets context around them.
 - **Re-ranking.** RRF gets you to a strong top-N. For the last mile, pipe the top 30-50 through a cross-encoder (cohere/rerank, voyage rerank, BGE-reranker) before returning the top 10.
 - **Multiple embedding columns.** If you want to swap embedding models without losing the old ones, add `embedding_large halfvec(3072)` for `text-embedding-3-large` and a parallel version counter. The worker reads both columns; search picks one. Bonus: zero-downtime migrations.
