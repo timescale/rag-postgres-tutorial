@@ -2,7 +2,7 @@
 -- `content` is the denormalized retrieval blob (descriptor + address + resolution).
 -- `meta` holds structured filters (agency, status, complaint_type, borough, ...).
 -- `tree` is `nyc.<borough>.<agency>.<complaint_type>`.
--- `temporal` is `[created_date, closed_date)` (or `[created_date, created_date]` if open).
+-- `temporal` is `[created_date, closed_date)` for closed tickets, `[created_date, 'infinity')` for open ones (still active).
 -- `geom` is the incident location in WGS84.
 create table documents
 ( id                  uuid          not null primary key default uuidv7()

@@ -73,7 +73,8 @@ create table documents
 -- meta must be an object, not a scalar or array
 alter table documents add check (jsonb_typeof(meta) = 'object');
 
--- temporal convention: point-in-time is [t,t] inclusive, ranges are [start,end)
+-- temporal convention: point-in-time is [t,t] inclusive; bounded ranges are
+-- [start,end); open-ended (still active) is [start,'infinity').
 alter table documents add constraint temporal_bounds_convention check (
     temporal is null
     or (lower(temporal) = upper(temporal) and lower_inc(temporal) and upper_inc(temporal))
@@ -88,7 +89,7 @@ A few decisions worth explaining:
 - **`embedding` is nullable.** Writes don't block on calling OpenAI. The vector is filled in asynchronously by a worker (Step 4). This is the single most important design decision in the whole post.
 - **`embedding_version` enforces correctness.** When content changes, this number ticks. The worker only writes back if the version still matches what it claimed — otherwise it would clobber a fresh row with a stale vector.
 - **`tree` (ltree) instead of `parent_id`.** Path queries (`work.projects.acme.notes <@ work.projects`) are O(log n) and don't need recursive CTEs. Patterns (`*.api.*`) and label queries (`api & v2`) are first-class. Labels are restricted to `[A-Za-z0-9_]` (max 256 chars), so sanitize at write time — e.g. `"Noise - Residential"` has to become `noise_residential` or you'll get `syntax error in ltree`.
-- **`temporal` (tstzrange) is optional.** Point-in-time events (`[t,t]`) and date ranges (`[start,end)`) live in the same column with the same operators.
+- **`temporal` (tstzrange) is optional.** Point-in-time events (`[t,t]`), bounded ranges (`[start,end)`), and still-open ranges (`[start,'infinity')`) live in the same column with the same operators.
 - **`geom` is a `geometry(Point, 4326)`.** SRID 4326 is WGS84 lat/lon — what GPS, OpenStreetMap, and basically every web map use. Store coordinates as `ST_SetSRID(ST_MakePoint(lon, lat), 4326)`. Note the order: PostGIS is `(longitude, latitude)`, not `(latitude, longitude)` — getting this wrong is the #1 PostGIS bug.
 
 ## Step 2 — The indexes
@@ -769,15 +770,16 @@ async function filterOnly(p: SearchParams, limit: number) {
 
 // --- Helpers ---
 
+// Route every JSONB parameter through this helper. `${JSON.stringify(obj)}::jsonb`
+// is a silent bug — Postgres receives a JSON scalar string, not the object.
+const jsonb = (v: unknown) => sql`${sql.json(v as postgres.JSONValue)}::jsonb`;
+
 function buildFilters(p: SearchParams) {
   // `postgres.Fragment` is the type the template tag accepts for nested
-  // pieces; arrays of fragments are stitched together at runtime. The
-  // `as postgres.JSONValue` cast on `p.meta` is to satisfy `sql.json(...)`'s
-  // readonly-recursive type — use `sql.json` rather than `JSON.stringify`,
-  // since a stringified object becomes a JSON scalar that matches nothing.
+  // pieces; arrays of fragments are stitched together at runtime.
   const parts: postgres.Fragment[] = [];
   if (p.tree)                                   parts.push(sql`and tree <@ ${p.tree}::ltree`);
-  if (p.meta && Object.keys(p.meta).length > 0) parts.push(sql`and meta @> ${sql.json(p.meta as postgres.JSONValue)}::jsonb`);
+  if (p.meta && Object.keys(p.meta).length > 0) parts.push(sql`and meta @> ${jsonb(p.meta)}`);
   if (p.temporal) {
     const { from, to } = p.temporal;
     if (from && to) parts.push(sql`and temporal && tstzrange(${from}::timestamptz, ${to}::timestamptz, '[)')`);

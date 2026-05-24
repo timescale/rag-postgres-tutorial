@@ -66,8 +66,10 @@ function buildTemporal(r: Record311): string | null {
     const endIso = new Date(r.closed_date).toISOString();
     if (endIso > startIso) return `[${startIso},${endIso})`;
   }
-  // Open ticket: a point-in-time event at created_date.
-  return `[${startIso},${startIso}]`;
+  // Open ticket: still active. Use [start, infinity) so it overlaps any
+  // window that includes now or future — that's "is this ticket open
+  // during the time the user is asking about?"
+  return `[${startIso},infinity)`;
 }
 
 function buildGeom(r: Record311): { lon: number; lat: number } | null {

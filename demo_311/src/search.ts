@@ -28,16 +28,17 @@ export interface SearchResult {
   meters?: number;  // populated whenever `near` is set
 }
 
+// Route every JSONB parameter through this helper. `${JSON.stringify(obj)}::jsonb`
+// is a silent bug — Postgres receives a JSON scalar string, not the object.
+const jsonb = (v: unknown) => sql`${sql.json(v as postgres.JSONValue)}::jsonb`;
+
 // Build a list of sql-fragment AND-conditions. postgres.js accepts a
 // Fragment[] interpolated into a sql`` template and concatenates the pieces.
 function buildFilters(p: SearchParams) {
   const parts: postgres.Fragment[] = [];
   if (p.tree) parts.push(sql`and tree <@ ${p.tree}::ltree`);
   if (p.meta && Object.keys(p.meta).length > 0) {
-    // Use sql.json: postgres.js encodes it as JSONB on the wire. Naive
-    // JSON.stringify(...)::jsonb gives Postgres a JSON scalar string,
-    // which @> on an object can never match.
-    parts.push(sql`and meta @> ${sql.json(p.meta as postgres.JSONValue)}`);
+    parts.push(sql`and meta @> ${jsonb(p.meta)}`);
   }
   if (p.temporal) {
     const { from, to } = p.temporal;

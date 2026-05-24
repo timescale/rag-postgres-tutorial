@@ -69,16 +69,7 @@ this linearly, since `SELECT FOR UPDATE SKIP LOCKED` partitions cleanly.
 These are the spots where the blog's snippets are wrong, incomplete, or
 ambiguous. Each one cost time to debug.
 
-1. **The blog's "use `sql.json` rather than `JSON.stringify`" warning is
-   correct, but the warning is buried in a comment and easy to miss.**
-   I hit this directly: writing `meta @> ${JSON.stringify(p.meta)}::jsonb`
-   compiles, runs, and silently returns zero hits — because postgres.js sends
-   the stringified JSON as a text parameter, and `text::jsonb` produces a JSON
-   *scalar string*, which `@>` on an object never matches. The blog could
-   make this trap louder; it's the kind of bug that hides in production for
-   weeks.
-
-2. **The worker writeback snippet has a subtle integer-precision footgun
+1. **The worker writeback snippet has a subtle integer-precision footgun
    that the surrounding comment only half-addresses.**
    The comment notes that postgres.js encodes `bigint` as a JS *string* to
    avoid precision loss. The snippet then passes `queueIds` (strings) through
@@ -86,30 +77,19 @@ ambiguous. Each one cost time to debug.
    `bigint`-shaped; readers copy-pasting into TypeScript with strict types
    get unexpected `string | number` unions. Worth a one-line callout.
 
-3. **No working `import postgres from 'postgres'` example covers the
+2. **No working `import postgres from 'postgres'` example covers the
    `debug` callback signature.**
    When trying to inspect generated SQL, you reach for `postgres(url, { debug })`,
    but the blog never shows it and the callback signature (`(connection, query, params, types) => void`)
    isn't obvious. Minor, but slows down anyone trying to debug the very
    issues called out above.
 
-4. **The MCP "all inputs are optional and nullable" advice produces noisy
+3. **The MCP "all inputs are optional and nullable" advice produces noisy
    types.** `z.string().optional().nullable()` yields `string | null | undefined`,
    so every handler does `args.foo ?? undefined` unwrapping. For nested
    objects like `temporal: { from, to }`, you have to unwrap twice (the
    outer object and the inner fields). The blog calls this out in a comment
    on `temporal`, but not on `near`. Easy to miss.
-
-5. **The temporal convention is hard to satisfy for open-ended events.**
-   The `temporal_bounds_convention` CHECK constraint accepts either a
-   point `[t,t]` or a half-open range `[start,end)`. An open 311 ticket
-   doesn't have an end time, so I chose `[created_date, created_date]`.
-   That works for `@>` (contains the instant) but it doesn't *overlap* a
-   window that starts after `created_date`, which can be surprising. The
-   tutorial doesn't discuss this trade-off; for live-state corpora you
-   probably want an "open-ended" representation (`[start, infinity)`),
-   which the current check constraint *forbids*. Mentioned in the schema
-   comment in `sql/02_schema.sql`.
 
 ## Notes
 
