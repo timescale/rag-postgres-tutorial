@@ -10,15 +10,15 @@ const model = openai.embeddingModel('text-embedding-3-small');
 const BATCH = 64;
 const LOCK = '5 minutes';
 
-type Claimed = {
-  queue_id: string;          // bigint comes back as JS string from postgres.js
+type ClaimedRow = {
+  queue_id: string;          // bigint comes back as a JS string from postgres.js — don't do arithmetic on it
   document_id: string;
   embedding_version: number;
   content: string;
 };
 
 async function processBatch(): Promise<number> {
-  const claimed = await sql<Claimed[]>`
+  const claimed = await sql<ClaimedRow[]>`
     select queue_id, document_id, embedding_version, content
     from claim_embedding_batch(${BATCH}, ${LOCK}::interval)
   `;

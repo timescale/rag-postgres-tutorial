@@ -329,10 +329,18 @@ import postgres from 'postgres';
 const sql = postgres(process.env.DATABASE_URL!);
 const model = openai.embeddingModel('text-embedding-3-small');
 
+type ClaimedRow = {
+  queue_id: string;          // bigint comes back as a JS string from postgres.js — don't do arithmetic on it
+  document_id: string;
+  embedding_version: number;
+  content: string;
+};
+
 async function processBatch() {
   // 1. Claim
-  const claimed = await sql`
-    select * from claim_embedding_batch(64, '5 minutes'::interval)
+  const claimed = await sql<ClaimedRow[]>`
+    select queue_id, document_id, embedding_version, content
+    from claim_embedding_batch(64, '5 minutes'::interval)
   `;
   if (claimed.length === 0) return 0;
 
@@ -346,7 +354,7 @@ async function processBatch() {
   // 3. Write back in a single round trip, version-guarded.
   const ids       = claimed.map(r => r.document_id);
   const versions  = claimed.map(r => r.embedding_version);
-  const queueIds  = claimed.map(r => r.queue_id);   // string — postgres.js encodes bigint as a JS string to avoid precision loss; pass through to ::bigint[], don't do arithmetic
+  const queueIds  = claimed.map(r => r.queue_id);
   const vecs      = embeddings.map(e => `[${e.join(',')}]`);
 
   await sql`
@@ -842,6 +850,12 @@ const server = new McpServer({
   version: '1.0.0',
 });
 
+// Accept undefined, null, *or* missing on the way in (LLMs sometimes pass null
+// instead of omitting fields) and normalize the output type to `T | undefined`
+// so handler code doesn't have to `?? undefined`-unwrap every field.
+const nullish = <T extends z.ZodTypeAny>(s: T) =>
+  s.optional().nullable().transform(v => v ?? undefined);
+
 server.registerTool(
   'documents_search',
   {
@@ -859,26 +873,24 @@ document's geom, regardless of which mode ranked the row. Use it to tell the use
 positive and unbounded (not comparable across different queries); hybrid (RRF) returns
 small fused values; filter-only is 1.0.`,
     inputSchema: {
-      semantic: z.string().optional().nullable()
+      semantic: nullish(z.string())
         .describe('Natural language query for vector search'),
-      fulltext: z.string().optional().nullable()
+      fulltext: nullish(z.string())
         .describe('Keywords/phrases for BM25'),
-      tree: z.string().optional().nullable()
+      tree: nullish(z.string())
         .describe('Tree filter. work.projects matches exactly; work.projects.* includes descendants'),
-      meta: z.record(z.string(), z.any()).optional().nullable()
+      meta: nullish(z.record(z.string(), z.any()))
         .describe('JSONB containment filter'),
-      temporal: z.object({
-        from: z.string().optional().nullable(),
-        to:   z.string().optional().nullable(),
-      }).optional().nullable()
-        .describe('ISO timestamps; restrict to documents whose temporal range overlaps [from, to)'),
-      near: z.object({
+      temporal: nullish(z.object({
+        from: nullish(z.string()),
+        to:   nullish(z.string()),
+      })).describe('ISO timestamps; restrict to documents whose temporal range overlaps [from, to)'),
+      near: nullish(z.object({
         lon: z.number(),
         lat: z.number(),
         radiusMeters: z.number(),
-      }).optional().nullable()
-        .describe('Geo filter: restrict to documents within radiusMeters of (lon, lat). Every returned row carries a `meters` field with the actual distance. With no other query, results are sorted by distance; otherwise text/vector score drives the order.'),
-      limit: z.number().int().optional().nullable()
+      })).describe('Geo filter: restrict to documents within radiusMeters of (lon, lat). Every returned row carries a `meters` field with the actual distance. With no other query, results are sorted by distance; otherwise text/vector score drives the order.'),
+      limit: nullish(z.number().int())
         .describe('Maximum results (default 10, max 1000)'),
     },
     annotations: {
@@ -887,18 +899,15 @@ small fused values; filter-only is 1.0.`,
     },
   },
   async (args) => {
+    // Every field is already `T | undefined` after the nullish() transform — no
+    // hand-unwrapping needed, including the inner fields of `temporal`.
     const results = await searchDocuments({
-      semantic: args.semantic ?? undefined,
-      fulltext: args.fulltext ?? undefined,
-      tree:     args.tree ?? undefined,
-      meta:     args.meta ?? undefined,
-      // `.nullable()` only strips the outer null; the inner fields are still
-      // `string | null | undefined`, so we have to unwrap them too.
-      temporal: args.temporal ? {
-        from: args.temporal.from ?? undefined,
-        to:   args.temporal.to   ?? undefined,
-      } : undefined,
-      near:     args.near ?? undefined,
+      semantic: args.semantic,
+      fulltext: args.fulltext,
+      tree:     args.tree,
+      meta:     args.meta,
+      temporal: args.temporal,
+      near:     args.near,
       limit:    args.limit && args.limit > 0 ? Math.min(args.limit, 1000) : 10,
     });
     return {
@@ -912,7 +921,7 @@ await server.connect(new StdioServerTransport());
 
 Three details that matter:
 
-- **All inputs are optional and nullable.** The MCP SDK has historically struggled with strict schemas. Make every field `.optional().nullable()` and unwrap `null → undefined` in the handler. Saves hours of debugging.
+- **All inputs are optional and nullable.** The MCP SDK has historically struggled with strict schemas, and LLMs sometimes pass `null` instead of omitting a field — so the *input* type has to be `T | null | undefined`. Wrapping with the `nullish` helper above accepts all three on the way in and normalizes the *output* type to `T | undefined`, so the handler never needs to `?? undefined`-unwrap. Saves hours of debugging.
 - **`readOnlyHint: true` and `idempotentHint: true`** let the host (Claude, Cursor) batch and cache calls and skip permission prompts.
 - **Write a long description, and tailor it to your actual corpus.** This is the only documentation the LLM reads to decide whether to call your tool. List the modes, the filter syntax, the score scale. The model's tool-selection quality is roughly proportional to description quality. The description above is generic on purpose — for your data, replace every abstract reference with the concrete shape:
   - **`meta`** — list the JSONB keys the agent can actually filter on and their value spaces (e.g. `agency` ∈ {`NYPD`, `DOT`, `DSNY`, …}, `status` ∈ {`Open`, `In Progress`, `Closed`}). Without this, the agent will guess key names that don't exist.

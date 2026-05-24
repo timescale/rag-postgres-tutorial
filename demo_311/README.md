@@ -69,27 +69,12 @@ this linearly, since `SELECT FOR UPDATE SKIP LOCKED` partitions cleanly.
 These are the spots where the blog's snippets are wrong, incomplete, or
 ambiguous. Each one cost time to debug.
 
-1. **The worker writeback snippet has a subtle integer-precision footgun
-   that the surrounding comment only half-addresses.**
-   The comment notes that postgres.js encodes `bigint` as a JS *string* to
-   avoid precision loss. The snippet then passes `queueIds` (strings) through
-   `::bigint[]`. Fine. But the snippet still types the local variable as
-   `bigint`-shaped; readers copy-pasting into TypeScript with strict types
-   get unexpected `string | number` unions. Worth a one-line callout.
-
-2. **No working `import postgres from 'postgres'` example covers the
+1. **No working `import postgres from 'postgres'` example covers the
    `debug` callback signature.**
    When trying to inspect generated SQL, you reach for `postgres(url, { debug })`,
    but the blog never shows it and the callback signature (`(connection, query, params, types) => void`)
    isn't obvious. Minor, but slows down anyone trying to debug the very
    issues called out above.
-
-3. **The MCP "all inputs are optional and nullable" advice produces noisy
-   types.** `z.string().optional().nullable()` yields `string | null | undefined`,
-   so every handler does `args.foo ?? undefined` unwrapping. For nested
-   objects like `temporal: { from, to }`, you have to unwrap twice (the
-   outer object and the inner fields). The blog calls this out in a comment
-   on `temporal`, but not on `near`. Easy to miss.
 
 ## Notes
 

@@ -5,6 +5,10 @@ import { searchDocuments } from './search.js';
 
 const server = new McpServer({ name: '311-documents', version: '1.0.0' });
 
+// Accept undefined, null, or missing on the way in; normalize output to T | undefined.
+const nullish = <T extends z.ZodTypeAny>(s: T) =>
+  s.optional().nullable().transform(v => v ?? undefined);
+
 server.registerTool(
   'documents_search',
   {
@@ -31,48 +35,43 @@ Filters (compose with each other and the text modes):
     borough ∈ {BROOKLYN, MANHATTAN, QUEENS, BRONX, STATEN ISLAND}
     zip (5-digit string)
     channel ∈ {ONLINE, PHONE, MOBILE, UNKNOWN, ...}
-- temporal: ISO timestamps; the row's temporal range is [created_date, closed_date) for closed tickets, or a point at created_date for open ones. Restricts to rows overlapping [from, to).
+- temporal: ISO timestamps; the row's temporal range is [created_date, closed_date) for closed tickets, or [created_date, infinity) for open ones (still active). Restricts to rows overlapping [from, to).
 - near: { lon, lat, radiusMeters } around the incident location. Coordinates are WGS84; New York City is roughly lon=-74, lat=40.7. With no other query, results are ordered by distance.
 
 Scores: BM25 returns positive similarity (higher = better, unbounded); semantic returns cosine similarity in [0, 1]; hybrid returns fused RRF scores (small numbers near 0.03); filter-only is 1.0. BM25 scores are not comparable across different queries.
 
 Result rows have shape { id, content, meta, tree, score }. When the request includes \`near\`, each row also carries \`meters\` — the great-circle distance from the anchor to the incident location, regardless of which mode ranked the row. Use it to tell the user "how far" a hit is.`,
     inputSchema: {
-      semantic: z.string().optional().nullable()
+      semantic: nullish(z.string())
         .describe('Natural language query for vector search'),
-      fulltext: z.string().optional().nullable()
+      fulltext: nullish(z.string())
         .describe('Keywords/phrases for BM25'),
-      tree: z.string().optional().nullable()
+      tree: nullish(z.string())
         .describe('Tree filter, e.g. nyc.brooklyn or nyc.brooklyn.nypd'),
-      meta: z.record(z.string(), z.any()).optional().nullable()
+      meta: nullish(z.record(z.string(), z.any()))
         .describe('JSONB containment filter, e.g. {"agency":"DSNY","status":"Open"}'),
-      temporal: z.object({
-        from: z.string().optional().nullable(),
-        to:   z.string().optional().nullable(),
-      }).optional().nullable()
-        .describe('Restrict to rows whose temporal range overlaps [from, to) (ISO timestamps)'),
-      near: z.object({
+      temporal: nullish(z.object({
+        from: nullish(z.string()),
+        to:   nullish(z.string()),
+      })).describe('Restrict to rows whose temporal range overlaps [from, to) (ISO timestamps)'),
+      near: nullish(z.object({
         lon: z.number(),
         lat: z.number(),
         radiusMeters: z.number(),
-      }).optional().nullable()
-        .describe('Restrict to rows within radiusMeters of (lon, lat)'),
-      limit: z.number().int().optional().nullable()
+      })).describe('Restrict to rows within radiusMeters of (lon, lat)'),
+      limit: nullish(z.number().int())
         .describe('Maximum results (default 10, max 1000)'),
     },
     annotations: { readOnlyHint: true, idempotentHint: true },
   },
   async (args) => {
     const results = await searchDocuments({
-      semantic: args.semantic ?? undefined,
-      fulltext: args.fulltext ?? undefined,
-      tree:     args.tree ?? undefined,
-      meta:     args.meta ?? undefined,
-      temporal: args.temporal ? {
-        from: args.temporal.from ?? undefined,
-        to:   args.temporal.to   ?? undefined,
-      } : undefined,
-      near:     args.near ?? undefined,
+      semantic: args.semantic,
+      fulltext: args.fulltext,
+      tree:     args.tree,
+      meta:     args.meta,
+      temporal: args.temporal,
+      near:     args.near,
       limit:    args.limit && args.limit > 0 ? Math.min(args.limit, 1000) : 10,
     });
     return { content: [{ type: 'text', text: JSON.stringify(results, null, 2) }] };
