@@ -123,18 +123,12 @@ create index documents_content_bm25_idx
 create index documents_embedding_hnsw_idx
   on documents using hnsw (embedding halfvec_cosine_ops)
   with (m = 16, ef_construction = 64);
-
--- Partial index for the worker to find rows that still need embeddings
-create index documents_pending_embedding_idx
-  on documents (created_at)
-  where embedding is null;
 ```
 
 Notes:
 
 - `k1=1.2, b=0.75` are the BM25 defaults. Increase `k1` to reward repeated terms, decrease `b` to weaken document-length normalization.
 - HNSW `m=16, ef_construction=64` is the safe default for ~1M docs. Bump `ef_construction` to 200+ if recall matters more than build time.
-- The partial index is critical. Your `documents` table will grow forever, but rows-needing-embedding is small (transient). Querying `where embedding is null` on a million-row table without this would be a sequential scan.
 
 ## Step 3 — The before-update trigger
 
@@ -665,6 +659,7 @@ interface SearchResult {
   meta: Record<string, unknown>;
   tree: string;
   score: number;
+  meters?: number;  // populated whenever `near` is set
 }
 
 export async function searchDocuments(params: SearchParams): Promise<SearchResult[]> {
@@ -698,7 +693,7 @@ export async function searchDocuments(params: SearchParams): Promise<SearchResul
     const topIds = fused.slice(0, limit).map(r => r.id);
     const scoreMap = new Map(fused.map(r => [r.id, r.score]));
 
-    const rows = await fetchByIds(topIds);
+    const rows = await fetchByIds(topIds, params);
     return rows.map(row => ({ ...row, score: scoreMap.get(row.id) ?? 0 }));
   }
 
@@ -709,11 +704,21 @@ export async function searchDocuments(params: SearchParams): Promise<SearchResul
 
 // --- Mode implementations ---
 
+// Whenever `near` is given, project ST_Distance as `meters` so every result
+// carries "how far".
+function metersProj(p: SearchParams) {
+  if (!p.near) return sql``;
+  return sql`, ST_Distance(geom::geography,
+                           ST_SetSRID(ST_MakePoint(${p.near.lon}, ${p.near.lat}), 4326)::geography
+                          ) as meters`;
+}
+
 async function bm25Search(query: string, p: SearchParams, limit: number) {
   const filters = buildFilters(p);
   return sql<SearchResult[]>`
     select id, content, meta, tree::text,
            -(content <@> to_bm25query(${query}, 'documents_content_bm25_idx')) as score
+           ${metersProj(p)}
     from documents
     where content <@> to_bm25query(${query}, 'documents_content_bm25_idx') < 0
       ${filters}
@@ -729,6 +734,7 @@ async function semanticSearch(vec: number[], p: SearchParams, limit: number) {
   return sql<SearchResult[]>`
     select id, content, meta, tree::text,
            (1 - (embedding <=> ${vecLit}::halfvec)) as score
+           ${metersProj(p)}
     from documents
     where embedding is not null
       and (1 - (embedding <=> ${vecLit}::halfvec)) >= ${threshold}
@@ -740,11 +746,12 @@ async function semanticSearch(vec: number[], p: SearchParams, limit: number) {
 
 async function filterOnly(p: SearchParams, limit: number) {
   const filters = buildFilters(p);
-  // If a geo anchor is given with no text/vector query, sort by distance using
-  // the kNN operator — it walks the GiST index in distance order.
+  // With a geo anchor and no text/vector query, sort by distance using the
+  // kNN operator — it walks the GiST index in distance order.
   if (p.near) {
     return sql<SearchResult[]>`
       select id, content, meta, tree::text, 1.0::float as score
+             ${metersProj(p)}
       from documents
       where geom is not null ${filters}
       order by geom <-> ST_SetSRID(ST_MakePoint(${p.near.lon}, ${p.near.lat}), 4326)
@@ -786,10 +793,11 @@ function buildFilters(p: SearchParams) {
   return parts.length > 0 ? sql`${parts}` : sql``;
 }
 
-async function fetchByIds(ids: string[]) {
+async function fetchByIds(ids: string[], p: SearchParams) {
   if (ids.length === 0) return [];
   return sql<SearchResult[]>`
     select id, content, meta, tree::text, 0::float as score
+           ${metersProj(p)}
     from documents
     where id = any(${ids}::uuid[])
     order by array_position(${ids}::uuid[], id)
@@ -840,7 +848,14 @@ server.registerTool(
 
 Modes: semantic (meaning), fulltext (keywords), or both (hybrid).
 For ordinary queries, set both semantic and fulltext to the same query string.
-Combine with tree, meta, temporal, and near (geo) filters. Results scored 0-1.`,
+Combine with tree, meta, temporal, and near (geo) filters.
+
+Each result row is { id, content, meta, tree, score }. When the request includes \`near\`,
+each row also carries \`meters\` — the great-circle distance from the anchor to the
+document's geom, regardless of which mode ranked the row. Use it to tell the user
+"how far" each hit is. Score scales: semantic is cosine similarity in [0,1]; BM25 is
+positive and unbounded (not comparable across different queries); hybrid (RRF) returns
+small fused values; filter-only is 1.0.`,
     inputSchema: {
       semantic: z.string().optional().nullable()
         .describe('Natural language query for vector search'),
@@ -860,7 +875,7 @@ Combine with tree, meta, temporal, and near (geo) filters. Results scored 0-1.`,
         lat: z.number(),
         radiusMeters: z.number(),
       }).optional().nullable()
-        .describe('Geo filter: restrict to documents within radiusMeters of (lon, lat). With no other query, results are sorted by distance.'),
+        .describe('Geo filter: restrict to documents within radiusMeters of (lon, lat). Every returned row carries a `meters` field with the actual distance. With no other query, results are sorted by distance; otherwise text/vector score drives the order.'),
       limit: z.number().int().optional().nullable()
         .describe('Maximum results (default 10, max 1000)'),
     },
