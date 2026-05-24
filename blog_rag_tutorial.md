@@ -47,8 +47,6 @@ create extension if not exists postgis;       -- geospatial types and indexes
 create extension if not exists pg_textsearch; -- BM25
 ```
 
-> `halfvec` is 16-bit floats (2 bytes/dim) instead of `vector`'s 32-bit floats. Half the storage, indistinguishable recall for embedding models like `text-embedding-3-small`. Always prefer it.
-
 If you want a hosted service, use [Tigerdata](https://tigerdata.com) or [ghost.build](https://ghost.build) — they're the only managed Postgres providers that ship `pg_textsearch` (Tiger Data's BM25 extension, used throughout this post). Other hosts will leave you stuck on `tsvector`/`tsquery`, which works but is materially worse than BM25 for ranking quality. If you're experimenting or doing AI-assisted development, prefer ghost.build: it has a generous free tier and its MCP server is purpose-built for agentic workflows, so Claude/Cursor can provision databases, run queries, and inspect schemas without you leaving the editor.
 
 For the worker, search, and MCP code (Steps 5–7), you'll want Node 20+ and the Vercel AI SDK — `ai@6` and `@ai-sdk/openai@3` are what the snippets are written against.
@@ -86,6 +84,7 @@ A few decisions worth explaining:
 
 - **One table or many?** Depends on whether you want to search across document types together or keep them separate. If a single query should be able to retrieve a blog post, an email, and a PDF in the same ranked result list, put them in one table and express the type in `meta->>'type'` — you get one set of indexes and one BM25/HNSW build to maintain. If the corpora are genuinely independent (different access patterns, different lifecycles, different embedding models), separate tables are fine and the same schema below still applies per-table.
 - **`id` is `uuidv7`.** The first 48 bits are a Unix-millisecond timestamp, so lexicographic order on `id` is creation order. `order by id desc` then gives newest-first *and* a deterministic tiebreak in one column — which Step 6 leans on, since BM25 scores tie heavily on structured corpora and `created_at` ties under bulk insert (a single `insert ... select` shares one `now()` timestamp across every row).
+- **`embedding` is `halfvec(1536)`.** `halfvec` is 16-bit floats (2 bytes/dim) instead of `vector`'s 32-bit floats — half the storage, indistinguishable recall for embedding models like `text-embedding-3-small`. Always prefer it.
 - **`embedding` is nullable.** Writes don't block on calling OpenAI. The vector is filled in asynchronously by a worker (Step 4). This is the single most important design decision in the whole post.
 - **`embedding_version` enforces correctness.** When content changes, this number ticks. The worker only writes back if the version still matches what it claimed — otherwise it would clobber a fresh row with a stale vector.
 - **`tree` (ltree) instead of `parent_id`.** Path queries (`work.projects.acme.notes <@ work.projects`) are O(log n) and don't need recursive CTEs. Patterns (`*.api.*`) and label queries (`api & v2`) are first-class. Labels are restricted to `[A-Za-z0-9_]` (max 256 chars), so sanitize at write time — e.g. `"Noise - Residential"` has to become `noise_residential` or you'll get `syntax error in ltree`.
@@ -314,6 +313,28 @@ Why each piece matters:
 
 The function is written in imperative PL/pgSQL (a `FOR` loop with `RETURN NEXT`) rather than the more common `RETURN QUERY` form. That's deliberate: the per-row guards (document-still-exists, version-still-matches, claim-update) need to run inside the loop, between the `SELECT ... FOR UPDATE SKIP LOCKED` and the `RETURN NEXT`. Refactoring to a single `RETURN QUERY SELECT ...` collapses those guards into the planner's order of operations and breaks the version-race correctness.
 
+### 4d. Pruning finalized rows
+
+Setting `outcome` to a terminal value (`completed` / `failed` / `cancelled`) makes a row invisible to the claim query but doesn't reclaim its space. Without pruning, the queue grows forever. A one-function delete, indexed by the partial index from 4a:
+
+```sql
+create function prune_embedding_queue(retention interval default '7 days')
+returns bigint
+language plpgsql as $$
+declare
+  pruned bigint;
+begin
+  delete from embedding_queue
+  where outcome is not null
+    and created_at < now() - retention;
+  get diagnostics pruned = row_count;
+  return pruned;
+end
+$$;
+```
+
+You can run this from `pg_cron` if you have it, but the worker itself is a fine driver — see Step 5.
+
 ## Step 5 — The worker
 
 The worker is a process (or several) that loops, claims batches, generates embeddings, writes them back. The shape:
@@ -342,7 +363,16 @@ async function processBatch() {
     select queue_id, document_id, embedding_version, content
     from claim_embedding_batch(64, '5 minutes'::interval)
   `;
-  if (claimed.length === 0) return 0;
+  if (claimed.length === 0) {
+    // Idle moment — opportunistic prune, best-effort.
+    try {
+      await sql`select prune_embedding_queue('7 days'::interval)`;
+    } catch (err) {
+      // Don't let prune failures trip the worker's error backoff.
+      console.warn('prune failed', err);
+    }
+    return 0;
+  }
 
   // 2. Embed (one HTTP call for the whole batch). The SDK retries 429s for us.
   const { embeddings } = await embedMany({
@@ -396,6 +426,7 @@ The behaviors to get right:
 2. **Version-guarded writeback** (`where embedding_version = $3`). This is the safety net for the race against concurrent content edits.
 3. **Multiple workers, zero coordination.** Thanks to `SKIP LOCKED`, you can run 1 or 10 workers without changing any code. They'll partition the queue cleanly.
 4. **Batch size, and a single bulk writeback.** Against a cloud DB at ~50–80 ms RTT, 32–128 is the sweet spot for the claim batch — smaller batches leave the worker waiting on the network, larger batches hold the visibility lease too long if the claim raises mid-flight. The writeback itself has to be a *single* statement using `unnest` to fan out the per-row updates; a naive per-row writeback (2 UPDATEs × batch size) is the throughput ceiling on a cloud DB.
+5. **Opportunistic pruning.** An empty `claim_embedding_batch` is the signal that there's no live work; that's the moment to call `prune_embedding_queue`. No scheduler to operate, and the prune runs at exactly the moments the database is least loaded. The `try/catch` matters: a prune failure (lock timeout, transient connection issue) shouldn't trip the worker's main error path and force a backoff — it's a janitorial task, not part of the critical loop.
 
 > **What about rate limits?** The AI SDK retries 429s with exponential backoff that respects `Retry-After`. For most workers, `maxRetries: 5` is plenty. If a request still fails after that, the batch raises, the visibility timeout on the queue rows lapses, and another worker (or the same one, after restart) picks them up — `attempts < max_attempts` in `claim_embedding_batch` is the final backstop. You only need custom rate-limit detection if you're running a multi-tenant worker that needs to pause globally on rate limits, or if you want to avoid counting 429s against a queue's retry budget. Both are advanced optimizations, not defaults.
 
