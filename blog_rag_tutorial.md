@@ -363,7 +363,7 @@ async function processBatch() {
   // 1. Claim
   const claimed = await sql<ClaimedRow[]>`
     select queue_id, document_id, embedding_version, content
-    from claim_embedding_batch(64, '5 minutes'::interval)
+    from claim_embedding_batch(128, '5 minutes'::interval)
   `;
   if (claimed.length === 0) {
     // Idle moment — opportunistic prune, best-effort.
@@ -430,7 +430,7 @@ The behaviors to get right:
 1. **Adaptive polling.** Loop immediately when you found work; sleep when idle. A worker that polls every 100ms when empty wastes the database. The `oneShot` flag lets the same script double as an initial backfiller — it returns on the first empty poll instead of sleeping.
 2. **Version-guarded writeback** (`where embedding_version = $3`). This is the safety net for the race against concurrent content edits.
 3. **Multiple workers, zero coordination.** Thanks to `SKIP LOCKED`, you can run 1 or 10 workers without changing any code. They'll partition the queue cleanly.
-4. **Batch size, and a single bulk writeback.** Against a cloud DB at ~50–80 ms RTT, 32–128 is the sweet spot for the claim batch — smaller batches leave the worker waiting on the network, larger batches hold the visibility lease too long if the claim raises mid-flight. The writeback itself has to be a *single* statement using `unnest` to fan out the per-row updates; a naive per-row writeback (2 UPDATEs × batch size) is the throughput ceiling on a cloud DB.
+4. **Batch size, and a single bulk writeback.** Default to a claim batch of 128 — it amortizes both the two DB round trips per batch (claim + writeback) *and* the per-request fixed overhead of the embedding HTTP call (DNS, TLS, server-side warm-up — these don't scale with row count), and stays well below `text-embedding-3-small`'s 2048-input cap. Raise to 256–512 only if RTT is >200ms *and* you've confirmed it actually helps; going smaller mainly leaves throughput on the table. The writeback itself has to be a *single* statement using `unnest` to fan out the per-row updates; a naive per-row writeback (2 UPDATEs × batch size) is the throughput ceiling on a cloud DB.
 5. **Opportunistic pruning.** An empty `claim_embedding_batch` is the signal that there's no live work; that's the moment to call `prune_embedding_queue`. No scheduler to operate, and the prune runs at exactly the moments the database is least loaded. The `try/catch` matters: a prune failure (lock timeout, transient connection issue) shouldn't trip the worker's main error path and force a backoff — it's a janitorial task, not part of the critical loop.
 
 > **What about rate limits?** The AI SDK retries 429s with exponential backoff that respects `Retry-After`. For most workers, `maxRetries: 5` is plenty. If a request still fails after that, the batch raises, the visibility timeout on the queue rows lapses, and another worker (or the same one, after restart) picks them up — `attempts < max_attempts` in `claim_embedding_batch` is the final backstop. You only need custom rate-limit detection if you're running a multi-tenant worker that needs to pause globally on rate limits, or if you want to avoid counting 429s against a queue's retry budget. Both are advanced optimizations, not defaults.
@@ -966,7 +966,7 @@ Three details that matter:
   - **`temporal`** — say what the range *means* (event time? validity window? `[created_at, closed_at)`?), because the same query against `created_at` vs. `closed_at` returns very different sets.
   - **`fulltext` / `semantic`** — say what `content` contains (the descriptor, the resolution, the address, all concatenated?), so the agent knows whether to expect a name match, a free-text paraphrase, or both.
 
-Wire up the MCP server in your client's config (e.g. `~/.config/claude/mcp.json`) and the agent can now retrieve from your database.
+Wire up the MCP server in your client's config and the agent can now retrieve from your database.
 
 For write operations (insert/update/delete), register additional tools with `readOnlyHint: false`. Be cautious about how aggressive you make destructive operations — most production setups make delete require an explicit ID, never a query.
 
