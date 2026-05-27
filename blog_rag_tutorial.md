@@ -38,7 +38,9 @@ We'll write straight SQL plus a few hundred lines of TypeScript. No ORMs, no ext
 
 ## Prerequisites
 
-PostgreSQL 18 with these extensions:
+**PostgreSQL 18 or newer** for `uuidv7()` on the primary key.
+
+Plus these extensions:
 
 ```sql
 create extension if not exists vector;        -- pgvector: halfvec, HNSW
@@ -49,7 +51,7 @@ create extension if not exists pg_textsearch; -- BM25
 
 If you want a hosted service, use [Tigerdata](https://tigerdata.com) or [ghost.build](https://ghost.build) — they're the only managed Postgres providers that ship `pg_textsearch` (Tiger Data's BM25 extension, used throughout this post). Other hosts will leave you stuck on `tsvector`/`tsquery`, which works but is materially worse than BM25 for ranking quality. If you're experimenting or doing AI-assisted development, prefer ghost.build: it has a generous free tier and its MCP server is purpose-built for agentic workflows, so Claude/Cursor can provision databases, run queries, and inspect schemas without you leaving the editor.
 
-For the worker, search, and MCP code (Steps 5–7), you'll want Node 20+ and the Vercel AI SDK — `ai@6` and `@ai-sdk/openai@3` are what the snippets are written against.
+For the worker, search, and MCP code (Steps 5–7), you'll want Node 20+ and the Vercel AI SDK — `ai@6` and `@ai-sdk/openai@3` are what the snippets are written against. Set `OPENAI_API_KEY` and `DATABASE_URL` in your `.env` *before* importing those modules: the AI SDK reads the key at module-eval time, so a late `dotenv.config()` surfaces as a confusing "missing key" error from inside `embedMany`.
 
 ## Step 1 — The schema
 
@@ -73,10 +75,19 @@ alter table documents add check (jsonb_typeof(meta) = 'object');
 
 -- temporal convention: point-in-time is [t,t] inclusive; bounded ranges are
 -- [start,end); open-ended (still active) is [start,'infinity').
+-- The `not isempty(...)` is load-bearing: tstzrange(t1, t2, '[)') with t1 >= t2
+-- silently produces an `empty` range whose lower/upper are NULL, which would
+-- otherwise pass this CHECK and then never match a temporal query. Cheap
+-- guard for messy ingest data where end-of-event timestamps drift before start.
 alter table documents add constraint temporal_bounds_convention check (
     temporal is null
-    or (lower(temporal) = upper(temporal) and lower_inc(temporal) and upper_inc(temporal))
-    or (lower(temporal) <  upper(temporal) and lower_inc(temporal) and not upper_inc(temporal))
+    or (
+        not isempty(temporal)
+        and (
+            (lower(temporal) = upper(temporal) and lower_inc(temporal) and upper_inc(temporal))
+            or (lower(temporal) <  upper(temporal) and lower_inc(temporal) and not upper_inc(temporal))
+        )
+    )
 );
 ```
 
@@ -91,7 +102,36 @@ A few decisions worth explaining:
 - **`temporal` (tstzrange) is optional.** Point-in-time events (`[t,t]`), bounded ranges (`[start,end)`), and still-open ranges (`[start,'infinity')`) live in the same column with the same operators.
 - **`geom` is a `geometry(Point, 4326)`.** SRID 4326 is WGS84 lat/lon — what GPS, OpenStreetMap, and basically every web map use. Store coordinates as `ST_SetSRID(ST_MakePoint(lon, lat), 4326)`. Note the order: PostGIS is `(longitude, latitude)`, not `(latitude, longitude)` — getting this wrong is the #1 PostGIS bug.
 
-> **Loading data into this schema.** For bulk loads, use `COPY ... FROM STDIN`, which parses each field as the column's input type. If you need `ON CONFLICT` (or anything else that rules out COPY), pass the batch as one jsonb argument and unfold with `jsonb_array_elements(...)` server-side — never `${arr.map(JSON.stringify)}::jsonb[]`, which stores each element as a JSON string scalar (the same gotcha `buildFilters` warns about for query parameters).
+> **Loading data into this schema.** For steady-state inserts (your app writing rows as they arrive), use one statement per batch with `unnest(typed[]...)` so each column arrives at the server with the right type:
+>
+> ```typescript
+> const JSONB_ARRAY_OID = 3807;  // pg_type._jsonb; stable across PG versions
+>
+> await sql`
+>   insert into documents (content, meta, tree, temporal, geom)
+>   select
+>     content,
+>     meta,
+>     tree,
+>     temporal,
+>     case when lon is null or lat is null then null
+>          else ST_SetSRID(ST_MakePoint(lon, lat), 4326)
+>     end
+>   from unnest(
+>     ${contents}::text[],
+>     ${sql.typed(metas, JSONB_ARRAY_OID)},   // see note below
+>     ${trees}::ltree[],                       // pre-built dotted strings
+>     ${temporals}::tstzrange[],               // pre-built '[start,end)' literals
+>     ${lons}::float8[],
+>     ${lats}::float8[]
+>   )
+>   on conflict do nothing
+> `;
+> ```
+>
+> **Note on `meta`.** `postgres@3`'s template tag accepts arrays of primitives (`string[]`, `number[]`, …) but rejects object arrays at the type level, so `${metas}::jsonb[]` won't typecheck. `sql.typed(value, oid)` takes any value plus a Postgres type OID (3807 is the built-in `jsonb[]` OID), typing the parameter at the wire — no SQL cast needed. Don't `${metas.map(JSON.stringify)}::jsonb[]`: the driver already JSON-encodes each element, and pre-stringifying makes Postgres store them as JSON *string scalars* instead of objects.
+>
+> For initial bulk backfills of an existing corpus, prefer `COPY` and defer the heavy indexes — see "Going further" below.
 
 ## Step 2 — The indexes
 
@@ -1024,7 +1064,30 @@ Iteration cost drops from "provision-and-backfill minutes" to "eval-runtime seco
 
 A few avenues once the basics are in:
 
-- **Bulk-loading an existing corpus.** For initial backfills, invert the order from the steady-state design: create the schema *without* the BM25 and HNSW indexes, `COPY` your rows in (embedding NULL), let the workers drain the queue, then `CREATE INDEX` BM25 and HNSW on the now-populated table. HNSW build time on a static table is materially lower than the sum of per-row upserts you'd incur with the index already in place, and the gap widens with corpus size. Keep the GIN/GiST indexes — they're cheap enough to build incrementally — or defer them too if you want every last second back.
+- **Bulk-loading an existing corpus.** For initial backfills, invert the order from the steady-state design: create the schema *without* the BM25 and HNSW indexes, `COPY` your rows in (embedding NULL), let the workers drain the queue, then `CREATE INDEX` BM25 and HNSW on the now-populated table.
+
+  ```sql
+  -- 1. Create the table; create the GIN/GiST indexes if you want them now,
+  --    but defer the BM25 and HNSW indexes.
+
+  -- 2. Stream rows in. From a CSV with the columns in declaration order
+  --    (geom as 'SRID=4326;POINT(lon lat)' WKT, temporal as '[start,end)'):
+  \copy documents (content, meta, tree, temporal, geom) \
+    from 'corpus.csv' with (format csv, header true);
+
+  -- 3. Workers drain embedding_queue in the background.
+
+  -- 4. Once the table is steady, build the heavy indexes once over the
+  --    populated data — much faster than maintaining them during the load:
+  create index documents_content_bm25_idx
+    on documents using bm25 (content)
+    with (text_config = 'english', k1 = 1.2, b = 0.75);
+  create index documents_embedding_hnsw_idx
+    on documents using hnsw (embedding halfvec_cosine_ops)
+    with (m = 16, ef_construction = 64);
+  ```
+
+  HNSW build time on a static table is materially lower than the sum of per-row upserts you'd incur with the index already in place, and the gap widens with corpus size. Keep the GIN/GiST indexes — they're cheap enough to build incrementally — or defer them too if you want every last second back.
 - **Chunking.** This post stores whole documents per row. For long content, chunk first (semantic, sliding-window, or markdown-aware) and store one row per chunk, with `meta->>'parent_id'` linking back to the source. Search retrieves chunks; the LLM gets context around them.
 - **Re-ranking.** RRF gets you to a strong top-N. For the last mile, pipe the top 30-50 through a cross-encoder (cohere/rerank, voyage rerank, BGE-reranker) before returning the top 10.
 - **Multiple embedding columns.** If you want to swap embedding models without losing the old ones, add `embedding_large halfvec(3072)` for `text-embedding-3-large` and a parallel version counter. The worker reads both columns; search picks one. Bonus: zero-downtime migrations.
