@@ -105,8 +105,6 @@ A few decisions worth explaining:
 > **Loading data into this schema.** For steady-state inserts (your app writing rows as they arrive), use one statement per batch with `unnest(typed[]...)` so each column arrives at the server with the right type:
 >
 > ```typescript
-> const JSONB_ARRAY_OID = 3807;  // pg_type._jsonb; stable across PG versions
->
 > await sql`
 >   insert into documents (content, meta, tree, temporal, geom)
 >   select
@@ -119,7 +117,7 @@ A few decisions worth explaining:
 >     end
 >   from unnest(
 >     ${contents}::text[],
->     ${sql.typed(metas, JSONB_ARRAY_OID)},   // see note below
+>     ${metas.map(m => JSON.stringify(m))}::text[]::jsonb[],  // see note below
 >     ${trees}::ltree[],                       // pre-built dotted strings
 >     ${temporals}::tstzrange[],               // pre-built '[start,end)' literals
 >     ${lons}::float8[],
@@ -129,7 +127,7 @@ A few decisions worth explaining:
 > `;
 > ```
 >
-> **Note on `meta`.** `postgres@3`'s template tag accepts arrays of primitives (`string[]`, `number[]`, …) but rejects object arrays at the type level, so `${metas}::jsonb[]` won't typecheck. `sql.typed(value, oid)` takes any value plus a Postgres type OID (3807 is the built-in `jsonb[]` OID), typing the parameter at the wire — no SQL cast needed. Don't `${metas.map(JSON.stringify)}::jsonb[]`: the driver already JSON-encodes each element, and pre-stringifying makes Postgres store them as JSON *string scalars* instead of objects.
+> **Note on `meta`.** `postgres@3`'s template tag rejects object arrays, so pre-stringify and let the `::text[]::jsonb[]` cast unpack them server-side. Avoid the `${metas as any}::jsonb[]` shortcut: the driver crashes on any meta with a top-level `type` key, mistaking the object for its internal `{type, value}` Parameter wrapper.
 >
 > For initial bulk backfills of an existing corpus, prefer `COPY` and defer the heavy indexes — see "Going further" below.
 

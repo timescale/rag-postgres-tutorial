@@ -1,20 +1,16 @@
 // Load NYC 311 Service Requests into the `documents` table.
 //
 // Uses the unnest(typed[]...) pattern from the tutorial's Step 1 inset.
-// Each column arrives at the server with its proper PG type. The `meta`
-// column is jsonb, and postgres@3's template tag types accept primitive
-// arrays (string[], number[], …) but not object arrays — so we use
-// sql.typed(metas, JSONB_ARRAY_OID) instead of an `as any` escape. The
-// generic overload of `sql.typed` accepts any value and an OID; passing
-// the wire-format OID skips both the TS error and the SQL ::cast.
+// Each column arrives at the server with its proper PG type. For `meta`,
+// pre-stringify to string[] and cast ::text[]::jsonb[] in SQL — postgres@3's
+// template tag rejects object arrays, and its array serializer sniffs each
+// element for a .type field (Parameter-unwrap convention), so passing raw
+// objects crashes the load on any meta with a top-level `type` key.
 
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { sql } from './db.js';
-
-// pg_type OIDs (stable across PG versions for built-in types).
-const JSONB_ARRAY_OID = 3807;  // _jsonb
 
 const here = dirname(fileURLToPath(import.meta.url));
 const DATA_PATH = join(here, '..', 'data', 'nyc311_1000.json');
@@ -137,7 +133,7 @@ async function main() {
         end as geom
       from unnest(
         ${contents}::text[],
-        ${sql.typed(metas, JSONB_ARRAY_OID)},
+        ${metas.map(m => JSON.stringify(m))}::text[]::jsonb[],
         ${trees}::ltree[],
         ${temporals}::tstzrange[],
         ${lons}::float8[],
