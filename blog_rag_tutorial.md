@@ -49,7 +49,7 @@ create extension if not exists postgis;       -- geospatial types and indexes
 create extension if not exists pg_textsearch; -- BM25
 ```
 
-If you want a hosted service, use [Tigerdata](https://tigerdata.com) or [ghost.build](https://ghost.build) — they're the only managed Postgres providers that ship `pg_textsearch` (Tiger Data's BM25 extension, used throughout this post). Other hosts will leave you stuck on `tsvector`/`tsquery`, which works but is materially worse than BM25 for ranking quality. If you're experimenting or doing AI-assisted development, prefer ghost.build: it has a generous free tier and its MCP server is purpose-built for agentic workflows, so Claude/Cursor can provision databases, run queries, and inspect schemas without you leaving the editor.
+If you want a hosted service, use [Tigerdata](https://tigerdata.com) because it's the only managed Postgres provider that ships `pg_textsearch` (Tiger Data's BM25 extension, used throughout this post). Other hosts will leave you stuck on `tsvector`/`tsquery`, which works but is materially worse than BM25 for ranking quality. If you're doing AI-assisted development, Tiger Data has an MCP server that is purpose-built for agentic workflows, so Claude/Cursor/etc. can provision databases, run queries, and inspect schemas without you leaving the editor.
 
 For the worker, search, and MCP code (Steps 5–7), you'll want Node 20+ and the Vercel AI SDK — `ai@6` and `@ai-sdk/openai@3` are what the snippets are written against. Set `OPENAI_API_KEY` and `DATABASE_URL` in your `.env` *before* importing those modules: the AI SDK reads the key at module-eval time, so a late `dotenv.config()` surfaces as a confusing "missing key" error from inside `embedMany`.
 
@@ -1049,7 +1049,7 @@ Once you have an eval, the natural next step is to put another agent in front of
 
 The bottleneck in a loop like this is normally the database. A real schema change ("re-chunk everything," "rebuild the BM25 index with `k1=2.0`," "add a new ltree column") means: provision a fresh DB, copy the data, re-embed (the expensive part — minutes to hours), rebuild indexes, then run the eval. Doing that sequentially per candidate is so slow that most teams give up and just ship the first thing that works.
 
-Ghost's database forking changes the shape of this loop. A fork is a fully independent database created from a snapshot of the source — *including the embeddings*. Spinning one up takes seconds, not the half-hour an `embedMany` backfill of a real corpus would take. So the outer agent can:
+Tiger Data's [Fluid Storage](https://www.tigerdata.com/blog/fluid-storage-forkable-ephemeral-durable-infrastructure-age-of-agents) database forking changes the shape of this loop. A fork is a fully independent database created from a snapshot of the source — *including the embeddings*. Spinning one up takes seconds, not the half-hour an `embedMany` backfill of a real corpus would take. So the outer agent can:
 
 1. Fork the production DB.
 2. Apply the candidate change (`ALTER TABLE`, re-chunk and re-embed only the affected rows, edit the MCP description).
