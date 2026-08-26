@@ -1,5 +1,5 @@
 {
-  "name": "demo_311",
+  "name": "rag-postgres-tutorial",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -11,16 +11,16 @@
     "mcp": "tsx src/mcp-server.ts"
   },
   "dependencies": {
-    "@ai-sdk/openai": "^3.0.0",
-    "@modelcontextprotocol/sdk": "^1.0.0",
-    "ai": "^6.0.0",
-    "dotenv": "^16.4.5",
-    "postgres": "^3.4.5",
-    "zod": "^3.23.8"
+    "@ai-sdk/openai": "^4.0.47",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "ai": "^7.0.79",
+    "dotenv": "^17.4.2",
+    "postgres": "^3.4.9",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
-    "@types/node": "^22.10.0",
-    "tsx": "^4.19.0",
-    "typescript": "^5.6.0"
+    "@types/node": "^26.3.0",
+    "tsx": "^4.23.12",
+    "typescript": "^7.0.2"
   }
 }
