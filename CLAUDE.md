@@ -1,6 +1,6 @@
 # cevian-content
 
-Blog drafts plus a working demo (`demo_311/`) used to audit each post against a real corpus before publishing. The blog and the demo evolve together — when the demo surfaces a problem, both get patched in the same commit.
+Blog drafts plus a working demo (`src/`, `sql/`) used to audit each post against a real corpus before publishing. The blog and the demo evolve together — when the demo surfaces a problem, both get patched in the same commit.
 
 ## postgres@3 array-serializer trap (load.ts)
 

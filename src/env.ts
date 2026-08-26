@@ -3,8 +3,8 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 const here = dirname(fileURLToPath(import.meta.url));
-// Project-local .env (DATABASE_URL) plus the repo-root .env (OPENAI_API_KEY).
-config({ path: [join(here, '..', '.env'), join(here, '..', '..', '.env')] });
+// Repo-root .env (DATABASE_URL, OPENAI_API_KEY).
+config({ path: join(here, '..', '.env') });
 
 export const DATABASE_URL = process.env.DATABASE_URL!;
 export const OPENAI_API_KEY = process.env.OPENAI_API_KEY!;
