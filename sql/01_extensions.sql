@@ -1,5 +1,6 @@
--- Extensions required for the 7-mode RAG schema.
-create extension if not exists vector;        -- pgvector: halfvec, HNSW
-create extension if not exists ltree;         -- hierarchical paths
-create extension if not exists postgis;       -- geospatial types and indexes
-create extension if not exists pg_textsearch; -- BM25
+-- Install extensions for vector search, hierarchies, geospatial, and full-text indexing
+
+CREATE EXTENSION IF NOT EXISTS vector;        -- Vector embeddings + HNSW indexing
+CREATE EXTENSION IF NOT EXISTS ltree;         -- Hierarchical paths (org.team.project)
+CREATE EXTENSION IF NOT EXISTS postgis;       -- Geospatial queries
+CREATE EXTENSION IF NOT EXISTS pg_textsearch; -- BM25 full-text search

@@ -1,22 +1,26 @@
-create or replace function enqueue_embedding() returns trigger as $$
-begin
-  insert into embedding_queue (document_id, embedding_version)
-  values (new.id, new.embedding_version);
-  return new;
-end
-$$ language plpgsql;
+-- Automatically enqueue jobs when: document inserted with embedding=NULL, or content updated.
+-- WHEN clause ensures we only enqueue when embedding is NULL (not for already-embedded docs).
 
-drop trigger if exists documents_enqueue_on_insert on documents;
-create trigger documents_enqueue_on_insert
-  after insert on documents
-  for each row
-  when (new.embedding is null)
-  execute function enqueue_embedding();
+CREATE OR REPLACE FUNCTION enqueue_embedding() RETURNS trigger AS $$
+BEGIN
+  INSERT INTO embedding_queue (document_id, embedding_version)
+  VALUES (new.id, new.embedding_version);
+  RETURN new;
+END
+$$ LANGUAGE plpgsql;
 
-drop trigger if exists documents_enqueue_on_update on documents;
-create trigger documents_enqueue_on_update
-  after update on documents
-  for each row
-  when (old.content is distinct from new.content
-        and new.embedding is null)
-  execute function enqueue_embedding();
+-- On INSERT: enqueue if embedding is NULL
+DROP TRIGGER IF EXISTS documents_enqueue_on_insert ON documents;
+CREATE TRIGGER documents_enqueue_on_insert
+  AFTER INSERT ON documents
+  FOR EACH ROW
+  WHEN (new.embedding IS NULL)
+  EXECUTE FUNCTION enqueue_embedding();
+
+-- On UPDATE: enqueue only if content changed (detected by before-update trigger nulling embedding)
+DROP TRIGGER IF EXISTS documents_enqueue_on_update ON documents;
+CREATE TRIGGER documents_enqueue_on_update
+  AFTER UPDATE ON documents
+  FOR EACH ROW
+  WHEN (old.content IS DISTINCT FROM new.content AND new.embedding IS NULL)
+  EXECUTE FUNCTION enqueue_embedding();

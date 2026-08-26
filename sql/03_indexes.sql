@@ -1,22 +1,29 @@
--- One index per search mode.
-create index if not exists documents_meta_gin_idx
-  on documents using gin (meta);
+-- One index per search mode. Drop the ones you don't use.
 
-create index if not exists documents_tree_gist_idx
-  on documents using gist (tree);
+-- METADATA: GIN index for @> (containment) queries
+CREATE INDEX IF NOT EXISTS documents_meta_gin_idx
+  ON documents USING gin (meta);
 
-create index if not exists documents_temporal_gist_idx
-  on documents using gist (temporal)
-  where temporal is not null;
+-- HIERARCHY: GiST index for <@ (ancestor/descendant) queries
+CREATE INDEX IF NOT EXISTS documents_tree_gist_idx
+  ON documents USING gist (tree);
 
-create index if not exists documents_geom_gist_idx
-  on documents using gist (geom)
-  where geom is not null;
+-- TEMPORAL: GiST index for && (overlap) range queries
+CREATE INDEX IF NOT EXISTS documents_temporal_gist_idx
+  ON documents USING gist (temporal)
+  WHERE temporal IS NOT NULL;
 
-create index if not exists documents_content_bm25_idx
-  on documents using bm25 (content)
-  with (text_config = 'english', k1 = 1.2, b = 0.75);
+-- GEOGRAPHIC: GiST index for ST_DWithin, ST_Intersects, <-> queries
+CREATE INDEX IF NOT EXISTS documents_geom_gist_idx
+  ON documents USING gist (geom)
+  WHERE geom IS NOT NULL;
 
-create index if not exists documents_embedding_hnsw_idx
-  on documents using hnsw (embedding halfvec_cosine_ops)
-  with (m = 16, ef_construction = 64);
+-- BM25 FULL-TEXT: BM25 ranking for keyword search
+CREATE INDEX IF NOT EXISTS documents_content_bm25_idx
+  ON documents USING bm25 (content)
+  WITH (text_config = 'english', k1 = 1.2, b = 0.75);
+
+-- VECTOR: HNSW index for <=> (nearest neighbor) search
+CREATE INDEX IF NOT EXISTS documents_embedding_hnsw_idx
+  ON documents USING hnsw (embedding halfvec_cosine_ops)
+  WITH (m = 16, ef_construction = 64);

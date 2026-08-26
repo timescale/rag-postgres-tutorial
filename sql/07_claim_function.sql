@@ -1,68 +1,85 @@
-create or replace function claim_embedding_batch(
-  batch_size    int      default 10,
-  lock_duration interval default '5 minutes'
+-- Core worker function: claims up to batch_size pending jobs, returns (queue_id, document_id, embedding_version, content).
+-- Handles: dedup (cancel superseded versions), crash recovery (mark failed), claiming (lock + increment attempts).
+-- FOR UPDATE SKIP LOCKED allows multiple workers to run concurrently.
+
+CREATE OR REPLACE FUNCTION claim_embedding_batch(
+  batch_size    int      DEFAULT 10,
+  lock_duration interval DEFAULT '5 minutes'
 )
-returns table (queue_id bigint, document_id uuid, embedding_version int, content text)
-language plpgsql as $$
-declare
+RETURNS TABLE (
+  queue_id          bigint,
+  document_id       uuid,
+  embedding_version int,
+  content           text
+)
+LANGUAGE plpgsql AS $$
+DECLARE
   rec record;
   doc record;
   claimed int := 0;
-begin
-  -- 1. Bulk-cancel jobs superseded by a newer version for the same document.
-  update embedding_queue eq
-    set outcome = 'cancelled'
-    where eq.outcome is null
-      and eq.vt <= now()
-      and exists (
-        select 1 from embedding_queue newer
-        where newer.document_id = eq.document_id
-          and newer.embedding_version > eq.embedding_version
-          and newer.outcome is null
-      );
+BEGIN
 
-  -- 2. Reap jobs orphaned by crashed workers.
-  update embedding_queue
-    set outcome = 'failed',
-        last_error = coalesce(last_error, 'exceeded max attempts (worker crash)')
-    where outcome is null and vt <= now() and attempts >= max_attempts;
+-- Dedup: cancel jobs superseded by newer versions
+UPDATE embedding_queue eq
+  SET outcome = 'cancelled'
+  WHERE eq.outcome IS NULL
+    AND eq.vt <= now()
+    AND EXISTS (
+      SELECT 1 FROM embedding_queue newer
+      WHERE newer.document_id = eq.document_id
+        AND newer.embedding_version > eq.embedding_version
+        AND newer.outcome IS NULL
+    );
 
-  -- 3. Claim eligible rows.
-  for rec in
-    select eq.id, eq.document_id, eq.embedding_version
-    from embedding_queue eq
-    where eq.outcome is null
-      and eq.vt <= now()
-      and eq.attempts < eq.max_attempts
-    order by eq.vt
-    for update skip locked
-  loop
-    select d.content, d.embedding_version into doc
-    from documents d where d.id = rec.document_id;
+-- Crash recovery: mark jobs as failed if retries exhausted
+UPDATE embedding_queue
+  SET outcome = 'failed',
+      last_error = COALESCE(last_error, 'exceeded max attempts')
+  WHERE outcome IS NULL
+    AND vt <= now()
+    AND attempts >= max_attempts;
 
-    if not found then
-      update embedding_queue set outcome = 'cancelled' where id = rec.id;
-      continue;
-    end if;
+-- Claim jobs: lock and return to worker
+FOR rec IN
+  SELECT eq.id, eq.document_id, eq.embedding_version
+  FROM embedding_queue eq
+  WHERE eq.outcome IS NULL
+    AND eq.vt <= now()
+    AND eq.attempts < eq.max_attempts
+  ORDER BY eq.vt
+  FOR UPDATE SKIP LOCKED
+LOOP
+  SELECT d.content, d.embedding_version INTO doc
+  FROM documents d
+  WHERE d.id = rec.document_id;
 
-    if rec.embedding_version <> doc.embedding_version then
-      update embedding_queue set outcome = 'cancelled' where id = rec.id;
-      continue;
-    end if;
+  -- Skip if document was deleted
+  IF NOT FOUND THEN
+    UPDATE embedding_queue SET outcome = 'cancelled' WHERE id = rec.id;
+    CONTINUE;
+  END IF;
 
-    update embedding_queue
-      set vt = now() + lock_duration,
-          attempts = embedding_queue.attempts + 1
-      where id = rec.id;
+  -- Skip if version is stale (content changed mid-embedding)
+  IF rec.embedding_version <> doc.embedding_version THEN
+    UPDATE embedding_queue SET outcome = 'cancelled' WHERE id = rec.id;
+    CONTINUE;
+  END IF;
 
-    queue_id          := rec.id;
-    document_id       := rec.document_id;
-    embedding_version := rec.embedding_version;
-    content           := doc.content;
-    return next;
+  -- Claim: mark as locked, increment attempts
+  UPDATE embedding_queue
+    SET vt = now() + lock_duration,
+        attempts = embedding_queue.attempts + 1
+    WHERE id = rec.id;
 
-    claimed := claimed + 1;
-    exit when claimed >= batch_size;
-  end loop;
-end
+  queue_id          := rec.id;
+  document_id       := rec.document_id;
+  embedding_version := rec.embedding_version;
+  content           := doc.content;
+  RETURN NEXT;
+
+  claimed := claimed + 1;
+  EXIT WHEN claimed >= batch_size;
+END LOOP;
+
+END
 $$;
