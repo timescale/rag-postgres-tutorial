@@ -26,9 +26,7 @@ The mechanism, exact:
 
 Verified empirically against the live Ghost DB on 2026-05-28: A (`as any` + `type` key) and C (`sql.typed` + `type` key) both crash with the `replace` error; B and D (same forms, no `type` key) succeed; E (`map(JSON.stringify)` → `text[]::jsonb[]`) and F (`sql.json(batch)` + `jsonb_array_elements`) both round-trip objects correctly with the `type` key present.
 
-This matters specifically because [blog_rag_tutorial.md:96](blog_rag_tutorial.md#L96) recommends `meta->>'type'` as the canonical discriminator pattern for mixed-corpus tables. A reader following that recommendation would crash on the first batch with any form other than E or F.
-
-The post's old warning ("Don't `${metas.map(JSON.stringify)}::jsonb[]`: the driver already JSON-encodes each element, and pre-stringifying makes Postgres store them as JSON string scalars") was **wrong** for the `text[]::jsonb[]` path. With explicit `::text[]` typing in the SQL cast chain, postgres.js infers `text[]` (driver serializer is just `'' + x`, no JSON encoding), then PG's server-side `jsonb_in` parses each text element as an object. Verified by round-tripping `{type: 'email', subject: 'hi'}` through this path and getting an object back, not a string scalar.
+The `meta->>'type'` pattern works as a canonical discriminator for mixed-corpus tables when following the safe `text[]::jsonb[]` serialization path. With explicit `::text[]` typing in the SQL cast chain, postgres.js infers `text[]` (driver serializer is just `'' + x`, no JSON encoding), then PG's server-side `jsonb_in` parses each text element as an object. Verified by round-tripping `{type: 'email', subject: 'hi'}` through this path and getting an object back, not a string scalar.
 
 ## Loader column-cast convention
 
